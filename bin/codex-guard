@@ -5,7 +5,8 @@ Codex Plus 5h Quota Guard (额度守护神)
 自动检测 Codex 5小时订阅额度。当 5h 额度低于设定阈值（默认 3%）时：
 1. 自动暂停/挂起 Codex 执行以避免消耗付费 Credits；
 2. 完整快照并保存当前会话（Session）与会话列表元数据；
-3. 待 5h 额度刷新恢复后，自动拉起/唤醒 Codex，并完整恢复原状（包括活跃会话上下文、会话锁及会话列表）。
+3. 待 5h 额度刷新恢复后，自动拉起/唤醒 Codex，自动向会话发送「继续」指令，
+   并完整恢复原状（包括活跃会话上下文、会话锁及会话列表）。
 """
 
 import os
@@ -427,9 +428,33 @@ class SessionManager:
                 pass
 
     @classmethod
-    def restore_and_verify_sessions(cls, resumed_pids: List[int]) -> Dict[str, Any]:
-        """额度恢复时：唤醒进程、验证会话状态、确保会话列表完整原状"""
+    def send_continue_prompt(cls, thread_id: str, prompt: str = "继续") -> bool:
+        """使用 codex queue 向指定会话发送消息（例如 '继续'）触发自动继续工作"""
+        try:
+            res = subprocess.run(
+                ["codex", "queue", "--thread", thread_id, "--message", prompt],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if res.returncode == 0:
+                log(f"已成功向会话 [{thread_id[:8]}...] 发送指令: '{prompt}'")
+                return True
+            else:
+                err_msg = res.stderr.strip() or res.stdout.strip()
+                log(f"向会话 [{thread_id[:8]}...] 发送指令失败: {err_msg}")
+                return False
+        except Exception as e:
+            log(f"向会话 [{thread_id[:8]}...] 发送指令异常: {e}")
+            return False
+
+    @classmethod
+    def restore_and_verify_sessions(cls, resumed_pids: List[int], send_continue: bool = True, continue_prompt: str = "继续") -> Dict[str, Any]:
+        """额度恢复时：唤醒进程、验证会话状态、确保会话列表完整原状，并自动发送「继续」指令"""
         cls.clean_stale_locks()
+
+        # 等待 1.5 秒让 Codex 进程与 App-Server 完成 socket 重建与状态恢复
+        time.sleep(1.5)
 
         # 读取暂停时的快照
         snapshot = {}
@@ -443,21 +468,35 @@ class SessionManager:
         saved_sessions = snapshot.get("sessions", [])
         loaded_now = cls.get_loaded_thread_ids()
 
-        restored_details = []
+        target_thread_ids = set()
         for sess in saved_sessions:
-            tid = sess.get("id")
-            title = sess.get("title", "(未命名任务)")
+            if sess.get("id"):
+                target_thread_ids.add(sess["id"])
+        for tid in loaded_now:
+            target_thread_ids.add(tid)
+
+        restored_details = []
+        for tid in target_thread_ids:
+            info = cls.get_thread_info(tid)
+            title = info.get("title", "(未命名任务)") if info else "(未命名任务)"
+            cwd = info.get("cwd") if info else None
             is_loaded = tid in loaded_now
+
+            queued = False
+            if send_continue:
+                queued = cls.send_continue_prompt(tid, continue_prompt)
+
             restored_details.append({
                 "id": tid,
                 "title": title,
-                "cwd": sess.get("cwd"),
-                "is_loaded": is_loaded
+                "cwd": cwd,
+                "is_loaded": is_loaded,
+                "continued": queued
             })
 
-        log(f"会话状态校验完成: 唤醒了 {len(resumed_pids)} 个进程，匹配 {len(restored_details)} 个活跃会话。")
+        log(f"会话状态校验与自动继续完成: 唤醒了 {len(resumed_pids)} 个进程，已向 {len(restored_details)} 个活跃会话自动发送「{continue_prompt}」。")
         for d in restored_details:
-            log(f"  • 会话 [{d['title']}] (ID: {d['id'][:8]}...) -> 状态: {'活跃并载入中' if d['is_loaded'] else '就绪(可通过 resume 继续)'}")
+            log(f"  • 会话 [{d['title']}] (ID: {d['id'][:8]}...) -> 状态: {'活跃并载入中' if d['is_loaded'] else '就绪'} | 发送「{continue_prompt}」: {'成功' if d.get('continued') else '未发送/跳过'}")
 
         return {
             "resumed_pids": resumed_pids,
@@ -683,16 +722,17 @@ def cmd_resume(args):
         if ProcessManager.resume_pid(pid):
             print(f"已发送 SIGCONT 唤醒 PID: {pid}")
 
-    SessionManager.restore_and_verify_sessions(stopped_pids)
-    send_notification("Codex 已手动唤醒", f"已唤醒 {len(stopped_pids)} 个 Codex 进程，会话列表已恢复原状。")
+    send_cont = not args.no_continue
+    SessionManager.restore_and_verify_sessions(stopped_pids, send_continue=send_cont, continue_prompt=args.continue_prompt)
+    send_notification("Codex 已手动唤醒", f"已唤醒 {len(stopped_pids)} 个 Codex 进程，已恢复原状并继续工作。")
 
 
-def run_watch_loop(threshold: float = 3.0, interval: int = 20, daemon_mode: bool = False):
+def run_watch_loop(threshold: float = 3.0, interval: int = 20, continue_prompt: str = "继续"):
     """核心守护监控主循环"""
-    log(f"Codex 额度守护神启动 (阈值: {threshold}%, 检查间隔: {interval}s)")
+    log(f"Codex 额度守护神启动 (阈值: {threshold}%, 检查间隔: {interval}s, 唤醒指令: '{continue_prompt}')")
     send_notification(
         "Codex 额度守护已启动",
-        f"守护监控生效中：当 5h 额度低于 {threshold}% 时自动暂停并快照，恢复后自动唤醒原状。",
+        f"守护监控生效中：当 5h 额度低于 {threshold}% 时自动暂停，恢复后自动唤醒原状并发送「{continue_prompt}」。",
     )
 
     suspended_pids = set()
@@ -733,7 +773,7 @@ def run_watch_loop(threshold: float = 3.0, interval: int = 20, daemon_mode: bool
                         "⚠️ Codex 额度不足，已自动暂停",
                         f"当前 5h 额度仅剩 {rem:.1f}%（低于 {threshold}% 保护线）！\n"
                         f"已保护性暂停 {len(newly_suspended)} 个任务以防扣除额外 Credits。{session_desc}\n"
-                        f"将在 {snap.reset_datetime_str} 额度刷新后自动恢复原状继续执行。",
+                        f"将在 {snap.reset_datetime_str} 额度刷新后自动唤醒并发送「{continue_prompt}」继续执行。",
                         urgency="critical",
                     )
 
@@ -749,7 +789,7 @@ def run_watch_loop(threshold: float = 3.0, interval: int = 20, daemon_mode: bool
             else:
                 # 检查之前被暂停的进程是否需要唤醒
                 if suspended_pids:
-                    log(f"✅ [额度已恢复] 5h额度已刷新，当前剩余 {rem:.1f}% (> {threshold}%)，准备自动恢复原状！")
+                    log(f"✅ [额度已恢复] 5h额度已刷新，当前剩余 {rem:.1f}% (> {threshold}%)，准备自动恢复原状并发送「{continue_prompt}」！")
                     resumed_pids = []
                     for pid in list(suspended_pids):
                         if os.path.exists(f"/proc/{pid}"):
@@ -758,12 +798,14 @@ def run_watch_loop(threshold: float = 3.0, interval: int = 20, daemon_mode: bool
                                 resumed_pids.append(pid)
                         suspended_pids.remove(pid)
 
-                    # 恢复会话列表与校验
-                    SessionManager.restore_and_verify_sessions(resumed_pids)
+                    # 恢复会话列表、校验并自动发送“继续”
+                    SessionManager.restore_and_verify_sessions(
+                        resumed_pids, send_continue=True, continue_prompt=continue_prompt
+                    )
 
                     send_notification(
                         "✅ Codex 5h 额度已恢复！",
-                        f"额度已刷新（当前剩余 {rem:.1f}%）！\n已自动唤醒 {len(resumed_pids)} 个任务，会话列表与上下文已完整恢复原状！",
+                        f"额度已刷新（当前剩余 {rem:.1f}%）！\n已自动唤醒 {len(resumed_pids)} 个任务并发送「{continue_prompt}」，会话与列表原状已恢复，继续工作中！",
                         urgency="normal",
                     )
 
@@ -781,7 +823,11 @@ def run_watch_loop(threshold: float = 3.0, interval: int = 20, daemon_mode: bool
 
 def cmd_watch(args):
     """启动监视循环"""
-    run_watch_loop(threshold=args.threshold, interval=args.interval)
+    run_watch_loop(
+        threshold=args.threshold,
+        interval=args.interval,
+        continue_prompt=args.continue_prompt,
+    )
 
 
 def cmd_run(args, unknown_args):
@@ -823,7 +869,7 @@ def cmd_run(args, unknown_args):
                     SessionManager.save_snapshot([proc.pid], reason="quota_exceeded")
                     send_notification(
                         "⚠️ Codex 任务已暂停",
-                        f"额度低于 {args.threshold}%，已暂停当前任务。将在刷新后自动恢复原状继续。",
+                        f"额度低于 {args.threshold}%，已暂停当前任务。将在刷新后自动发送「{args.continue_prompt}」继续执行。",
                     )
                     ProcessManager.suspend_pid(proc.pid)
 
@@ -837,8 +883,12 @@ def cmd_run(args, unknown_args):
                             if snap.remaining_percent > args.threshold:
                                 log(f"✅ [Guard Run] 额度已恢复（剩余 {snap.remaining_percent:.1f}%），自动唤醒 PID {proc.pid}！")
                                 ProcessManager.resume_pid(proc.pid)
-                                SessionManager.restore_and_verify_sessions([proc.pid])
-                                send_notification("✅ Codex 任务已唤醒", "5h 额度已恢复，会话原状已恢复并继续执行！")
+                                SessionManager.restore_and_verify_sessions(
+                                    [proc.pid],
+                                    send_continue=True,
+                                    continue_prompt=args.continue_prompt,
+                                )
+                                send_notification("✅ Codex 任务已唤醒", f"5h 额度已恢复，已发送「{args.continue_prompt}」，继续工作中！")
                                 break
             time.sleep(args.interval)
     except KeyboardInterrupt:
@@ -863,7 +913,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart={exec_path} watch --threshold {args.threshold} --interval {args.interval}
+ExecStart={exec_path} watch --threshold {args.threshold} --interval {args.interval} --continue-prompt "{args.continue_prompt}"
 Restart=always
 RestartSec=10
 Environment=PATH={os.path.dirname(exec_path)}:/usr/local/bin:/usr/bin:/bin
@@ -879,7 +929,7 @@ WantedBy=default.target
         subprocess.run(["systemctl", "--user", "restart", SERVICE_NAME], check=True)
         subprocess.run(["systemctl", "--user", "enable", SERVICE_NAME], check=True)
         print(f"\033[32m[成功] 已安装并启动系统后台服务: {SERVICE_NAME}\033[0m")
-        print("开机或用户登录时将自动常驻后台监控，无需手动运行！")
+        print("开机或用户登录时将自动常驻后台监控，恢复时将自动发送「继续」，无需手动干预！")
 
     elif action == "uninstall":
         subprocess.run(["systemctl", "--user", "stop", SERVICE_NAME], check=False)
@@ -895,7 +945,7 @@ WantedBy=default.target
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Codex Plus 5h 额度守护神：低于 3% 自动暂停防扣 Credits，恢复后自动唤醒原状"
+        description="Codex Plus 5h 额度守护神：低于 3% 自动暂停防扣 Credits，恢复后自动唤醒原状并发送「继续」"
     )
     subparsers = parser.add_subparsers(dest="subcommand", help="子命令")
 
@@ -910,6 +960,7 @@ def main():
     p_watch = subparsers.add_parser("watch", help="在前台启动守护监视器")
     p_watch.add_argument("--threshold", type=float, default=3.0, help="额度剩余百分比阈值 (默认: 3.0)")
     p_watch.add_argument("--interval", type=int, default=20, help="监控轮询间隔秒数 (默认: 20)")
+    p_watch.add_argument("--continue-prompt", type=str, default="继续", help="恢复时向会话自动发送的指令 (默认: '继续')")
 
     # pause
     subparsers.add_parser("pause", help="手动暂停正在运行的 Codex 客户端进程并记录快照")
@@ -917,17 +968,21 @@ def main():
     # resume
     p_resume = subparsers.add_parser("resume", help="手动唤醒被暂停的 Codex 客户端进程或恢复指定 session")
     p_resume.add_argument("session_id", nargs="?", default=None, help="可选：指定恢复的 Session ID")
+    p_resume.add_argument("--no-continue", action="store_true", help="唤醒后不发送「继续」指令")
+    p_resume.add_argument("--continue-prompt", type=str, default="继续", help="恢复时发送的指令 (默认: '继续')")
 
     # run
     p_run = subparsers.add_parser("run", help="包装运行 Codex 并自动保护当前任务与会话")
     p_run.add_argument("--threshold", type=float, default=3.0, help="额度剩余百分比阈值 (默认: 3.0)")
     p_run.add_argument("--interval", type=int, default=15, help="监控轮询间隔秒数 (默认: 15)")
+    p_run.add_argument("--continue-prompt", type=str, default="继续", help="恢复时发送的指令 (默认: '继续')")
 
     # service
     p_service = subparsers.add_parser("service", help="管理 systemd 守护服务 (install / uninstall / status)")
     p_service.add_argument("action", choices=["install", "uninstall", "status"], help="操作")
     p_service.add_argument("--threshold", type=float, default=3.0, help="额度剩余百分比阈值 (默认: 3.0)")
     p_service.add_argument("--interval", type=int, default=20, help="监控轮询间隔秒数 (默认: 20)")
+    p_service.add_argument("--continue-prompt", type=str, default="继续", help="恢复时发送的指令 (默认: '继续')")
 
     # 如果无子命令，默认使用 status
     if len(sys.argv) == 1:

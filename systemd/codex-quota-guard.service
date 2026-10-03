@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/codex-guard watch --threshold 3.0 --interval 20
+ExecStart=%h/.local/bin/codex-guard watch --threshold 3.0 --interval 20 --continue-prompt "继续"
 Restart=always
 RestartSec=10
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
