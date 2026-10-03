@@ -1,0 +1,15 @@
+[Unit]
+Description=Codex Plus 5h Quota Guard Sentinel
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/codex-guard watch --threshold 3.0 --interval 20
+Restart=always
+RestartSec=10
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=DISPLAY=:0
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+
+[Install]
+WantedBy=default.target

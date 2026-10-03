@@ -1,0 +1,964 @@
+#!/usr/bin/env python3
+"""
+Codex Plus 5h Quota Guard (额度守护神)
+=====================================
+自动检测 Codex 5小时订阅额度。当 5h 额度低于设定阈值（默认 3%）时：
+1. 自动暂停/挂起 Codex 执行以避免消耗付费 Credits；
+2. 完整快照并保存当前会话（Session）与会话列表元数据；
+3. 待 5h 额度刷新恢复后，自动拉起/唤醒 Codex，并完整恢复原状（包括活跃会话上下文、会话锁及会话列表）。
+"""
+
+import os
+import sys
+import time
+import socket
+import select
+import base64
+import struct
+import json
+import signal
+import glob
+import sqlite3
+import subprocess
+import argparse
+from datetime import datetime
+from typing import Optional, Dict, Any, List, Tuple
+
+LOG_FILE = os.path.expanduser("~/.codex/quota_guard.log")
+SNAPSHOT_FILE = os.path.expanduser("~/.codex/quota_guard_snapshot.json")
+SERVICE_NAME = "codex-quota-guard"
+SERVICE_FILE = os.path.expanduser(f"~/.config/systemd/user/{SERVICE_NAME}.service")
+
+
+def log(msg: str, print_to_stdout: bool = True):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    formatted = f"[{timestamp}] {msg}"
+    if print_to_stdout:
+        print(formatted, flush=True)
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(formatted + "\n")
+    except Exception:
+        pass
+
+
+def send_notification(title: str, message: str, urgency: str = "normal"):
+    """发送系统桌面通知 (通过 notify-send)"""
+    env = os.environ.copy()
+    if "DISPLAY" not in env:
+        env["DISPLAY"] = ":0"
+    if "DBUS_SESSION_BUS_ADDRESS" not in env:
+        uid = os.getuid()
+        bus_path = f"/run/user/{uid}/bus"
+        if os.path.exists(bus_path):
+            env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus_path}"
+
+    try:
+        subprocess.run(
+            ["notify-send", "-a", "Codex Quota Guard", "-u", urgency, title, message],
+            env=env,
+            timeout=5,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+class CodexSocketClient:
+    """与 Codex App-Server Daemon 进行 WebSocket 通信的轻量客户端"""
+
+    @staticmethod
+    def get_socket_path() -> Optional[str]:
+        # 1. 优先尝试 ~/.codex/app-server-control/app-server-control.sock
+        default_link = os.path.expanduser("~/.codex/app-server-control/app-server-control.sock")
+        if os.path.exists(default_link):
+            return os.path.realpath(default_link)
+
+        # 2. 搜索 /tmp/codex-daemon-* 下的 socket
+        candidates = glob.glob(f"/tmp/codex-daemon-{os.getuid()}/*")
+        for cand in candidates:
+            try:
+                mode = os.stat(cand).st_mode
+                import stat
+                if stat.S_ISSOCK(mode):
+                    return cand
+            except OSError:
+                pass
+        return None
+
+    @classmethod
+    def ensure_daemon_running(cls) -> bool:
+        sock_path = cls.get_socket_path()
+        if sock_path and os.path.exists(sock_path):
+            return True
+        try:
+            # 尝试自启动 daemon
+            subprocess.run(
+                ["codex", "app-server", "daemon", "start"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+            time.sleep(1)
+            sock_path = cls.get_socket_path()
+            return sock_path is not None and os.path.exists(sock_path)
+        except Exception:
+            return False
+
+    @classmethod
+    def query_app_server(cls, method: str, params: Optional[Dict[str, Any]] = None, timeout: float = 6.0) -> Optional[Any]:
+        if not cls.ensure_daemon_running():
+            return None
+
+        sock_path = cls.get_socket_path()
+        if not sock_path:
+            return None
+
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect(sock_path)
+
+            # 1. WebSocket 握手
+            key = base64.b64encode(os.urandom(16)).decode("utf-8")
+            req = (
+                f"GET / HTTP/1.1\r\n"
+                f"Host: localhost\r\n"
+                f"Upgrade: websocket\r\n"
+                f"Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\n"
+                f"Sec-WebSocket-Version: 13\r\n\r\n"
+            )
+            s.sendall(req.encode("utf-8"))
+
+            resp_header = b""
+            while b"\r\n\r\n" not in resp_header:
+                chunk = s.recv(512)
+                if not chunk:
+                    return None
+                resp_header += chunk
+
+            def send_frame(payload_str: str):
+                data = payload_str.encode("utf-8")
+                length = len(data)
+                mask = os.urandom(4)
+                hdr = bytearray([0x81])
+                if length <= 125:
+                    hdr.append(0x80 | length)
+                elif length <= 65535:
+                    hdr.append(0x80 | 126)
+                    hdr.extend(struct.pack("!H", length))
+                else:
+                    hdr.append(0x80 | 127)
+                    hdr.extend(struct.pack("!Q", length))
+                hdr.extend(mask)
+                masked = bytearray(data[i] ^ mask[i % 4] for i in range(length))
+                s.sendall(hdr + masked)
+
+            def recv_frame():
+                header = s.recv(2)
+                if len(header) < 2:
+                    return None, None
+                b1, b2 = header[0], header[1]
+                opcode = b1 & 0x0F
+                is_masked = (b2 & 0x80) != 0
+                length = b2 & 0x7F
+                if length == 126:
+                    length = struct.unpack("!H", s.recv(2))[0]
+                elif length == 127:
+                    length = struct.unpack("!Q", s.recv(8))[0]
+
+                mask = s.recv(4) if is_masked else None
+                buf = bytearray()
+                while len(buf) < length:
+                    chunk = s.recv(min(4096, length - len(buf)))
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+                if is_masked and mask:
+                    buf = bytearray(buf[i] ^ mask[i % 4] for i in range(len(buf)))
+                return opcode, bytes(buf)
+
+            # 2. 发送 initialize
+            send_frame(json.dumps({
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {"name": "quota-guard", "title": "quota-guard", "version": "1.0"},
+                    "capabilities": {"experimentalApi": True, "requestAttestation": False}
+                }
+            }))
+
+            start_t = time.time()
+            while time.time() - start_t < 3:
+                _, data = recv_frame()
+                if not data:
+                    break
+                try:
+                    msg = json.loads(data.decode("utf-8"))
+                    if msg.get("id") == 1:
+                        break
+                except Exception:
+                    continue
+
+            # 3. 发送请求
+            send_frame(json.dumps({
+                "id": 2,
+                "method": method,
+                "params": params or {}
+            }))
+
+            while time.time() - start_t < timeout:
+                _, data = recv_frame()
+                if not data:
+                    break
+                try:
+                    msg = json.loads(data.decode("utf-8"))
+                    if msg.get("id") == 2:
+                        return msg.get("result", {})
+                except Exception:
+                    continue
+
+            return None
+        except Exception:
+            return None
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    @classmethod
+    def query_rate_limits(cls, timeout: float = 6.0) -> Optional[Dict[str, Any]]:
+        return cls.query_app_server("account/rateLimits/read", {}, timeout)
+
+    @classmethod
+    def query_loaded_threads(cls, timeout: float = 4.0) -> List[str]:
+        res = cls.query_app_server("thread/loaded/list", {}, timeout)
+        if isinstance(res, dict) and "data" in res:
+            return res["data"]
+        return []
+
+
+class QuotaSnapshot:
+    """格式化后的 Codex 额度快照"""
+
+    def __init__(self, raw_data: Optional[Dict[str, Any]]):
+        self.raw = raw_data or {}
+        rl = self.raw.get("rateLimits", {})
+        self.plan_type = rl.get("planType") or "unknown"
+        self.has_credits = rl.get("credits", {}).get("hasCredits", False)
+        self.credit_balance = rl.get("credits", {}).get("balance", "0.0")
+
+        # 查找 5 小时窗口 (windowDurationMins == 300)
+        p = rl.get("primary") or {}
+        s = rl.get("secondary") or {}
+
+        w5 = None
+        if p.get("windowDurationMins") == 300:
+            w5 = p
+            self.weekly_window = s
+        elif s.get("windowDurationMins") == 300:
+            w5 = s
+            self.weekly_window = p
+        else:
+            w5 = p
+            self.weekly_window = s
+
+        self.used_percent: float = float(w5.get("usedPercent", 0))
+        self.remaining_percent: float = max(0.0, 100.0 - self.used_percent)
+        self.resets_at: int = int(w5.get("resetsAt", 0))
+        self.window_duration_mins: int = int(w5.get("windowDurationMins", 300))
+
+    @property
+    def seconds_until_reset(self) -> float:
+        if self.resets_at <= 0:
+            return 0.0
+        return max(0.0, float(self.resets_at - time.time()))
+
+    @property
+    def reset_datetime_str(self) -> str:
+        if self.resets_at <= 0:
+            return "未知"
+        return datetime.fromtimestamp(self.resets_at).strftime("%Y-%m-%d %H:%M:%S")
+
+    @property
+    def time_to_reset_str(self) -> str:
+        secs = int(self.seconds_until_reset)
+        if secs <= 0:
+            return "已到期/即将刷新"
+        hours = secs // 3600
+        mins = (secs % 3600) // 60
+        if hours > 0:
+            return f"{hours}小时 {mins}分钟"
+        return f"{mins}分钟 ({secs}秒)"
+
+
+class SessionManager:
+    """会话生命周期与列表恢复管理器"""
+
+    DB_PATH = os.path.expanduser("~/.codex/state_5.sqlite")
+    LOCK_DIR = os.path.expanduser("~/.codex/thread-writer-locks")
+    INDEX_FILE = os.path.expanduser("~/.codex/session_index.jsonl")
+
+    @classmethod
+    def get_loaded_thread_ids(cls) -> List[str]:
+        """获取当前正在加载中的活跃会话 ID 列表"""
+        # 1. 优先尝试从 app-server 查询
+        threads = CodexSocketClient.query_loaded_threads()
+        if threads:
+            return threads
+        # 2. 从 writer lock 文件检索
+        if os.path.exists(cls.LOCK_DIR):
+            res = []
+            for f in os.listdir(cls.LOCK_DIR):
+                if f.endswith(".lock") and not f.startswith("."):
+                    res.append(f[:-5])
+            return res
+        return []
+
+    @classmethod
+    def get_thread_info(cls, thread_id: str) -> Optional[Dict[str, Any]]:
+        """获取指定会话的完整元数据"""
+        if not os.path.exists(cls.DB_PATH):
+            return None
+        try:
+            conn = sqlite3.connect(cls.DB_PATH)
+            c = conn.cursor()
+            c.execute(
+                "SELECT id, title, cwd, updated_at, source, model FROM threads WHERE id = ?",
+                (thread_id,)
+            )
+            row = c.fetchone()
+            conn.close()
+            if row:
+                return {
+                    "id": row[0],
+                    "title": row[1] or "(未命名任务)",
+                    "cwd": row[2],
+                    "updated_at": row[3],
+                    "source": row[4],
+                    "model": row[5]
+                }
+        except Exception:
+            pass
+        return None
+
+    @classmethod
+    def get_recent_sessions(cls, limit: int = 15) -> List[Dict[str, Any]]:
+        """从 SQLite 获取最近的会话列表"""
+        if not os.path.exists(cls.DB_PATH):
+            return []
+        try:
+            conn = sqlite3.connect(cls.DB_PATH)
+            c = conn.cursor()
+            c.execute(
+                """SELECT id, title, cwd, updated_at, source, model, archived
+                   FROM threads 
+                   WHERE archived = 0 
+                   ORDER BY updated_at DESC 
+                   LIMIT ?""",
+                (limit,)
+            )
+            rows = c.fetchall()
+            conn.close()
+            res = []
+            for r in rows:
+                res.append({
+                    "id": r[0],
+                    "title": r[1] or "(未命名任务)",
+                    "cwd": r[2],
+                    "updated_at": r[3],
+                    "source": r[4],
+                    "model": r[5],
+                    "archived": bool(r[6])
+                })
+            return res
+        except Exception:
+            return []
+
+    @classmethod
+    def save_snapshot(cls, active_pids: List[int], reason: str = "quota_low") -> Dict[str, Any]:
+        """暂停前保存活跃会话与列表快照"""
+        loaded_ids = cls.get_loaded_thread_ids()
+        sessions = []
+        for tid in loaded_ids:
+            info = cls.get_thread_info(tid)
+            if info:
+                sessions.append(info)
+
+        snapshot = {
+            "timestamp": time.time(),
+            "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "reason": reason,
+            "active_pids": active_pids,
+            "loaded_thread_ids": loaded_ids,
+            "sessions": sessions,
+        }
+
+        try:
+            with open(SNAPSHOT_FILE, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, ensure_ascii=False, indent=2)
+            log(f"已保存会话快照: {len(sessions)} 个活跃会话 (PIDs: {active_pids})")
+        except Exception as e:
+            log(f"保存会话快照失败: {e}")
+
+        return snapshot
+
+    @classmethod
+    def clean_stale_locks(cls):
+        """检查并清理无进程持有的死锁文件，防止会话恢复时报被占用错误"""
+        if not os.path.exists(cls.LOCK_DIR):
+            return
+        for fname in os.listdir(cls.LOCK_DIR):
+            if not fname.endswith(".lock") or fname.startswith("."):
+                continue
+            lpath = os.path.join(cls.LOCK_DIR, fname)
+            try:
+                # 检查是否有活跃进程持有此锁
+                res = subprocess.run(["fuser", lpath], capture_output=True, text=True, timeout=1)
+                pids = res.stdout.strip().split()
+                if not pids and not res.stderr.strip():
+                    os.remove(lpath)
+                    log(f"清理无进程持有的会话锁: {fname}")
+            except Exception:
+                pass
+
+    @classmethod
+    def restore_and_verify_sessions(cls, resumed_pids: List[int]) -> Dict[str, Any]:
+        """额度恢复时：唤醒进程、验证会话状态、确保会话列表完整原状"""
+        cls.clean_stale_locks()
+
+        # 读取暂停时的快照
+        snapshot = {}
+        if os.path.exists(SNAPSHOT_FILE):
+            try:
+                with open(SNAPSHOT_FILE, "r", encoding="utf-8") as f:
+                    snapshot = json.load(f)
+            except Exception:
+                pass
+
+        saved_sessions = snapshot.get("sessions", [])
+        loaded_now = cls.get_loaded_thread_ids()
+
+        restored_details = []
+        for sess in saved_sessions:
+            tid = sess.get("id")
+            title = sess.get("title", "(未命名任务)")
+            is_loaded = tid in loaded_now
+            restored_details.append({
+                "id": tid,
+                "title": title,
+                "cwd": sess.get("cwd"),
+                "is_loaded": is_loaded
+            })
+
+        log(f"会话状态校验完成: 唤醒了 {len(resumed_pids)} 个进程，匹配 {len(restored_details)} 个活跃会话。")
+        for d in restored_details:
+            log(f"  • 会话 [{d['title']}] (ID: {d['id'][:8]}...) -> 状态: {'活跃并载入中' if d['is_loaded'] else '就绪(可通过 resume 继续)'}")
+
+        return {
+            "resumed_pids": resumed_pids,
+            "sessions": restored_details
+        }
+
+
+class ProcessManager:
+    """管理并监测本机上的 Codex 客户端进程"""
+
+    @staticmethod
+    def get_codex_client_pids() -> List[Tuple[int, str, str]]:
+        """获取所有正在运行的 Codex 客户端进程 (排除 daemon, helper 和自身)
+        返回: [(pid, state, cmdline)]
+        state: 'T' 为已被挂起暂停, 'S'/'R' 为正在运行
+        """
+        my_pid = os.getpid()
+        results = []
+        for pid_dir in glob.glob("/proc/[0-9]*"):
+            try:
+                pid = int(os.path.basename(pid_dir))
+                if pid == my_pid:
+                    continue
+                cmdline_path = os.path.join(pid_dir, "cmdline")
+                if not os.path.exists(cmdline_path):
+                    continue
+                with open(cmdline_path, "rb") as f:
+                    content = f.read().decode("utf-8", errors="ignore")
+                parts = [p for p in content.split("\0") if p]
+                if not parts:
+                    continue
+
+                exe = parts[0]
+                cmd_full = " ".join(parts)
+
+                # 必须包含 codex
+                if "codex" not in exe.lower() and not any("codex" in p.lower() for p in parts[:2]):
+                    continue
+
+                # 排除内部守护进程和服务
+                if any(x in cmd_full for x in ["app-server", "daemon", "code-mode-host", "quota-guard", "codex-guard"]):
+                    continue
+
+                # 读取状态
+                stat_path = os.path.join(pid_dir, "stat")
+                with open(stat_path, "r") as f:
+                    stat_parts = f.read().split()
+                    state = stat_parts[2]  # R, S, D, Z, T
+
+                results.append((pid, state, cmd_full))
+            except (ValueError, FileNotFoundError, PermissionError, ProcessLookupError):
+                continue
+        return results
+
+    @staticmethod
+    def suspend_pid(pid: int) -> bool:
+        try:
+            os.kill(pid, signal.SIGSTOP)
+            return True
+        except ProcessLookupError:
+            return False
+        except Exception as e:
+            log(f"暂停 PID {pid} 失败: {e}")
+            return False
+
+    @staticmethod
+    def resume_pid(pid: int) -> bool:
+        try:
+            os.kill(pid, signal.SIGCONT)
+            return True
+        except ProcessLookupError:
+            return False
+        except Exception as e:
+            log(f"恢复 PID {pid} 失败: {e}")
+            return False
+
+
+def cmd_status(args):
+    """显示当前额度及守护状态"""
+    data = CodexSocketClient.query_rate_limits()
+    if not data:
+        print("\033[31m[错误] 无法连接到 Codex App-Server Daemon，请确保 Codex 已安装并启动。\033[0m")
+        sys.exit(1)
+
+    snap = QuotaSnapshot(data)
+    pids = ProcessManager.get_codex_client_pids()
+    loaded_threads = SessionManager.get_loaded_thread_ids()
+
+    # 颜色设定
+    green = "\033[32m"
+    yellow = "\033[33m"
+    red = "\033[31m"
+    cyan = "\033[36m"
+    bold = "\033[1m"
+    reset = "\033[0m"
+
+    if snap.remaining_percent <= 3.0:
+        quota_color = red
+        status_text = f"{red}🚨 额度极低 (< 3%)！守护拦截激活{reset}"
+    elif snap.remaining_percent <= 10.0:
+        quota_color = yellow
+        status_text = f"{yellow}⚠️ 额度偏低 (3% - 10%){reset}"
+    else:
+        quota_color = green
+        status_text = f"{green}🟢 额度充足{reset}"
+
+    print(f"\n{bold}{cyan}============================================================{reset}")
+    print(f"{bold}{cyan}              Codex Plus 5h 额度守护状态监控               {reset}")
+    print(f"{bold}{cyan}============================================================{reset}")
+    print(f"订阅计划:        {bold}{snap.plan_type.upper()}{reset}")
+    print(f"5小时额度窗口:   {quota_color}已用 {snap.used_percent:.1f}% | 剩余 {snap.remaining_percent:.1f}%{reset} (窗口时长: {snap.window_duration_mins} 分钟)")
+    print(f"重置时间:        {bold}{snap.reset_datetime_str}{reset} (距离刷新还有: {snap.time_to_reset_str})")
+
+    if snap.weekly_window:
+        w_used = float(snap.weekly_window.get("usedPercent", 0))
+        w_rem = max(0.0, 100.0 - w_used)
+        print(f"周额度窗口:      已用 {w_used:.1f}% | 剩余 {w_rem:.1f}%")
+
+    print(f"额外 Credits:    {snap.credit_balance} ({'已充值但避免消耗' if snap.has_credits else '无额度'})")
+    print(f"守护触发阈值:    低于 {bold}3.0%{reset} 自动暂停")
+    print(f"当前额度评估:    {status_text}")
+    print(f"{cyan}------------------------------------------------------------{reset}")
+
+    if not pids:
+        print("当前运行中进程:  无正在运行的 Codex 客户端进程")
+    else:
+        print(f"受守护进程 ({len(pids)} 个):")
+        for p, st, cmd in pids:
+            st_desc = f"{red}已暂停 (STOPPED){reset}" if st == "T" else f"{green}运行中 (RUNNING){reset}"
+            cmd_preview = cmd if len(cmd) <= 45 else cmd[:42] + "..."
+            print(f"  • PID {bold}{p}{reset} [{st_desc}] : {cmd_preview}")
+
+    # 显示当前活跃会话
+    if loaded_threads:
+        print(f"\n当前活跃会话 (已锁定载入):")
+        for tid in loaded_threads:
+            info = SessionManager.get_thread_info(tid)
+            if info:
+                print(f"  • {bold}{info['title']}{reset} (ID: {tid[:8]}...) [工作目录: {info['cwd']}]")
+            else:
+                print(f"  • 会话 ID: {tid}")
+
+    # 检查 systemd 服务状态
+    service_status = "未运行"
+    try:
+        res = subprocess.run(
+            ["systemctl", "--user", "is-active", SERVICE_NAME],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if res.stdout.strip() == "active":
+            service_status = f"{green}🟢 后台守护服务运行中 (Active){reset}"
+        else:
+            service_status = f"{yellow}⚪ 后台守护服务未启动 (Inactive){reset}"
+    except Exception:
+        pass
+    print(f"后台守护服务:    {service_status}")
+    print(f"{bold}{cyan}============================================================{reset}\n")
+
+
+def cmd_sessions(args):
+    """显示会话列表及当前状态"""
+    recent = SessionManager.get_recent_sessions(limit=args.limit)
+    loaded = set(SessionManager.get_loaded_thread_ids())
+
+    green = "\033[32m"
+    yellow = "\033[33m"
+    cyan = "\033[36m"
+    bold = "\033[1m"
+    reset = "\033[0m"
+
+    print(f"\n{bold}{cyan}============================================================{reset}")
+    print(f"{bold}{cyan}                   Codex 会话列表状态                       {reset}")
+    print(f"{bold}{cyan}============================================================{reset}")
+
+    if not recent:
+        print("未检测到历史会话记录。")
+    else:
+        for idx, s in enumerate(recent, 1):
+            is_active = s["id"] in loaded
+            tag = f"{green}[活跃载入中]{reset}" if is_active else f"[历史就绪]"
+            up_dt = datetime.fromtimestamp(s["updated_at"]).strftime("%Y-%m-%d %H:%M") if s["updated_at"] else "未知"
+            title = s["title"] if len(s["title"]) <= 32 else s["title"][:29] + "..."
+            print(f"{idx:2d}. {tag} {bold}{title:<32}{reset} (更新: {up_dt})")
+            print(f"    ID: {s['id']} | CWD: {s['cwd']}")
+
+    print(f"\n{cyan}提示: 可执行 codex resume [ID] 或 codex resume --last 无缝继续任意任务。{reset}")
+    print(f"{bold}{cyan}============================================================{reset}\n")
+
+
+def cmd_pause(args):
+    """手动暂停所有运行中的 Codex 客户端进程"""
+    pids = ProcessManager.get_codex_client_pids()
+    active_pids = [p for p, st, _ in pids if st != "T"]
+    if not active_pids:
+        print("没有处于运行中的 Codex 客户端进程需要暂停。")
+        return
+
+    # 保存会话快照
+    SessionManager.save_snapshot(active_pids, reason="manual_pause")
+
+    for pid in active_pids:
+        if ProcessManager.suspend_pid(pid):
+            print(f"已发送 SIGSTOP 暂停 PID: {pid}")
+    send_notification("Codex 已手动暂停", f"已暂停 {len(active_pids)} 个 Codex 进程，会话状态与列表已记录。")
+
+
+def cmd_resume(args):
+    """手动恢复所有被暂停的 Codex 客户端进程或恢复指定 session"""
+    if args.session_id:
+        cmd = ["codex", "resume", args.session_id]
+        print(f"正在拉起会话: {' '.join(cmd)}")
+        os.execvp("codex", cmd)
+        return
+
+    pids = ProcessManager.get_codex_client_pids()
+    stopped_pids = [p for p, st, _ in pids if st == "T"]
+    if not stopped_pids:
+        print("没有处于暂停状态的 Codex 客户端进程需要唤醒。")
+        return
+    for pid in stopped_pids:
+        if ProcessManager.resume_pid(pid):
+            print(f"已发送 SIGCONT 唤醒 PID: {pid}")
+
+    SessionManager.restore_and_verify_sessions(stopped_pids)
+    send_notification("Codex 已手动唤醒", f"已唤醒 {len(stopped_pids)} 个 Codex 进程，会话列表已恢复原状。")
+
+
+def run_watch_loop(threshold: float = 3.0, interval: int = 20, daemon_mode: bool = False):
+    """核心守护监控主循环"""
+    log(f"Codex 额度守护神启动 (阈值: {threshold}%, 检查间隔: {interval}s)")
+    send_notification(
+        "Codex 额度守护已启动",
+        f"守护监控生效中：当 5h 额度低于 {threshold}% 时自动暂停并快照，恢复后自动唤醒原状。",
+    )
+
+    suspended_pids = set()
+
+    try:
+        while True:
+            data = CodexSocketClient.query_rate_limits()
+            if not data:
+                time.sleep(interval)
+                continue
+
+            snap = QuotaSnapshot(data)
+            rem = snap.remaining_percent
+
+            # 情况 1: 额度低于阈值 -> 必须停止/暂停
+            if rem <= threshold:
+                client_pids = ProcessManager.get_codex_client_pids()
+                newly_suspended = []
+
+                for pid, state, cmd in client_pids:
+                    if state != "T":
+                        if ProcessManager.suspend_pid(pid):
+                            suspended_pids.add(pid)
+                            newly_suspended.append(pid)
+                            log(f"⚠️ [额度预警] 5h额度仅剩 {rem:.1f}% (<= {threshold}%)！已暂停 Codex (PID {pid}: {cmd})")
+
+                if newly_suspended:
+                    # 快照记录会话元数据与列表
+                    SessionManager.save_snapshot(list(suspended_pids), reason="quota_exceeded")
+                    loaded_threads = SessionManager.get_loaded_thread_ids()
+                    session_desc = ""
+                    if loaded_threads:
+                        tinfo = SessionManager.get_thread_info(loaded_threads[0])
+                        if tinfo:
+                            session_desc = f"\n当前任务: {tinfo['title']}"
+
+                    send_notification(
+                        "⚠️ Codex 额度不足，已自动暂停",
+                        f"当前 5h 额度仅剩 {rem:.1f}%（低于 {threshold}% 保护线）！\n"
+                        f"已保护性暂停 {len(newly_suspended)} 个任务以防扣除额外 Credits。{session_desc}\n"
+                        f"将在 {snap.reset_datetime_str} 额度刷新后自动恢复原状继续执行。",
+                        urgency="critical",
+                    )
+
+                # 计算距离重置的时间并进行等待
+                secs_left = snap.seconds_until_reset
+                if secs_left > 0:
+                    sleep_step = min(max(10, secs_left - 5), 30)
+                    time.sleep(sleep_step)
+                else:
+                    time.sleep(5)
+
+            # 情况 2: 额度已恢复正常 (> 阈值)
+            else:
+                # 检查之前被暂停的进程是否需要唤醒
+                if suspended_pids:
+                    log(f"✅ [额度已恢复] 5h额度已刷新，当前剩余 {rem:.1f}% (> {threshold}%)，准备自动恢复原状！")
+                    resumed_pids = []
+                    for pid in list(suspended_pids):
+                        if os.path.exists(f"/proc/{pid}"):
+                            if ProcessManager.resume_pid(pid):
+                                log(f"已唤醒 PID {pid} 继续执行。")
+                                resumed_pids.append(pid)
+                        suspended_pids.remove(pid)
+
+                    # 恢复会话列表与校验
+                    SessionManager.restore_and_verify_sessions(resumed_pids)
+
+                    send_notification(
+                        "✅ Codex 5h 额度已恢复！",
+                        f"额度已刷新（当前剩余 {rem:.1f}%）！\n已自动唤醒 {len(resumed_pids)} 个任务，会话列表与上下文已完整恢复原状！",
+                        urgency="normal",
+                    )
+
+                # 正常间隔休眠
+                time.sleep(interval)
+
+    except KeyboardInterrupt:
+        log("收到中断信号，守护退出。")
+        if suspended_pids:
+            print("注意: 退出时仍有被暂停的进程，正在全部唤醒...")
+            for pid in suspended_pids:
+                ProcessManager.resume_pid(pid)
+            SessionManager.clean_stale_locks()
+
+
+def cmd_watch(args):
+    """启动监视循环"""
+    run_watch_loop(threshold=args.threshold, interval=args.interval)
+
+
+def cmd_run(args, unknown_args):
+    """包装运行模式: codex-guard run [codex 参数...]"""
+    cmd_args = unknown_args
+    if not cmd_args:
+        cmd_args = []
+
+    # 1. 检查启动前额度
+    data = CodexSocketClient.query_rate_limits()
+    if data:
+        snap = QuotaSnapshot(data)
+        if snap.remaining_percent <= args.threshold:
+            print(f"\033[33m[Codex Guard] 当前 5h 额度仅剩 {snap.remaining_percent:.1f}% (<= {args.threshold}%)！\033[0m")
+            print(f"[Codex Guard] 为避免消耗付费 Credits，正在等待额度在 {snap.reset_datetime_str} 刷新...")
+            send_notification("Codex 延迟启动", f"当前 5h 额度仅剩 {snap.remaining_percent:.1f}%，等待恢复后再自动启动。")
+            while True:
+                data = CodexSocketClient.query_rate_limits()
+                if data:
+                    snap = QuotaSnapshot(data)
+                    if snap.remaining_percent > args.threshold:
+                        print(f"\033[32m[Codex Guard] 5h 额度已恢复 (剩余 {snap.remaining_percent:.1f}%)，现在启动 Codex！\033[0m")
+                        break
+                time.sleep(15)
+
+    # 2. 启动真实 codex 进程
+    real_codex = "/home/lizhonghu/.local/bin/codex"
+    full_cmd = [real_codex] + cmd_args
+    proc = subprocess.Popen(full_cmd)
+
+    # 3. 伴随监控线程或循环
+    try:
+        while proc.poll() is None:
+            data = CodexSocketClient.query_rate_limits()
+            if data:
+                snap = QuotaSnapshot(data)
+                if snap.remaining_percent <= args.threshold:
+                    log(f"⚠️ [Guard Run] 5h额度仅剩 {snap.remaining_percent:.1f}%！正在暂停子进程 PID {proc.pid}...")
+                    SessionManager.save_snapshot([proc.pid], reason="quota_exceeded")
+                    send_notification(
+                        "⚠️ Codex 任务已暂停",
+                        f"额度低于 {args.threshold}%，已暂停当前任务。将在刷新后自动恢复原状继续。",
+                    )
+                    ProcessManager.suspend_pid(proc.pid)
+
+                    # 等待恢复
+                    while proc.poll() is None:
+                        secs_left = snap.seconds_until_reset
+                        time.sleep(min(max(10, secs_left - 5), 30))
+                        data = CodexSocketClient.query_rate_limits()
+                        if data:
+                            snap = QuotaSnapshot(data)
+                            if snap.remaining_percent > args.threshold:
+                                log(f"✅ [Guard Run] 额度已恢复（剩余 {snap.remaining_percent:.1f}%），自动唤醒 PID {proc.pid}！")
+                                ProcessManager.resume_pid(proc.pid)
+                                SessionManager.restore_and_verify_sessions([proc.pid])
+                                send_notification("✅ Codex 任务已唤醒", "5h 额度已恢复，会话原状已恢复并继续执行！")
+                                break
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        try:
+            proc.send_signal(signal.SIGINT)
+            proc.wait(timeout=3)
+        except Exception:
+            proc.kill()
+    sys.exit(proc.returncode if proc.returncode is not None else 0)
+
+
+def cmd_service(args):
+    """管理 systemd 用户级守护服务"""
+    action = args.action
+    exec_path = os.path.realpath(__file__)
+
+    if action == "install":
+        os.makedirs(os.path.dirname(SERVICE_FILE), exist_ok=True)
+        content = f"""[Unit]
+Description=Codex Plus 5h Quota Guard Sentinel
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={exec_path} watch --threshold {args.threshold} --interval {args.interval}
+Restart=always
+RestartSec=10
+Environment=PATH={os.path.dirname(exec_path)}:/usr/local/bin:/usr/bin:/bin
+Environment=DISPLAY=:0
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{os.getuid()}/bus
+
+[Install]
+WantedBy=default.target
+"""
+        with open(SERVICE_FILE, "w", encoding="utf-8") as f:
+            f.write(content)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+        subprocess.run(["systemctl", "--user", "restart", SERVICE_NAME], check=True)
+        subprocess.run(["systemctl", "--user", "enable", SERVICE_NAME], check=True)
+        print(f"\033[32m[成功] 已安装并启动系统后台服务: {SERVICE_NAME}\033[0m")
+        print("开机或用户登录时将自动常驻后台监控，无需手动运行！")
+
+    elif action == "uninstall":
+        subprocess.run(["systemctl", "--user", "stop", SERVICE_NAME], check=False)
+        subprocess.run(["systemctl", "--user", "disable", SERVICE_NAME], check=False)
+        if os.path.exists(SERVICE_FILE):
+            os.remove(SERVICE_FILE)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+        print(f"\033[32m[成功] 已卸载后台服务: {SERVICE_NAME}\033[0m")
+
+    elif action == "status":
+        subprocess.run(["systemctl", "--user", "status", SERVICE_NAME])
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Codex Plus 5h 额度守护神：低于 3% 自动暂停防扣 Credits，恢复后自动唤醒原状"
+    )
+    subparsers = parser.add_subparsers(dest="subcommand", help="子命令")
+
+    # status
+    subparsers.add_parser("status", help="查询当前 5h 额度、重置时间及守护状态")
+
+    # sessions
+    p_sess = subparsers.add_parser("sessions", help="查看所有 Codex 会话列表与活跃/挂起状态")
+    p_sess.add_argument("--limit", type=int, default=15, help="显示数量 (默认: 15)")
+
+    # watch
+    p_watch = subparsers.add_parser("watch", help="在前台启动守护监视器")
+    p_watch.add_argument("--threshold", type=float, default=3.0, help="额度剩余百分比阈值 (默认: 3.0)")
+    p_watch.add_argument("--interval", type=int, default=20, help="监控轮询间隔秒数 (默认: 20)")
+
+    # pause
+    subparsers.add_parser("pause", help="手动暂停正在运行的 Codex 客户端进程并记录快照")
+
+    # resume
+    p_resume = subparsers.add_parser("resume", help="手动唤醒被暂停的 Codex 客户端进程或恢复指定 session")
+    p_resume.add_argument("session_id", nargs="?", default=None, help="可选：指定恢复的 Session ID")
+
+    # run
+    p_run = subparsers.add_parser("run", help="包装运行 Codex 并自动保护当前任务与会话")
+    p_run.add_argument("--threshold", type=float, default=3.0, help="额度剩余百分比阈值 (默认: 3.0)")
+    p_run.add_argument("--interval", type=int, default=15, help="监控轮询间隔秒数 (默认: 15)")
+
+    # service
+    p_service = subparsers.add_parser("service", help="管理 systemd 守护服务 (install / uninstall / status)")
+    p_service.add_argument("action", choices=["install", "uninstall", "status"], help="操作")
+    p_service.add_argument("--threshold", type=float, default=3.0, help="额度剩余百分比阈值 (默认: 3.0)")
+    p_service.add_argument("--interval", type=int, default=20, help="监控轮询间隔秒数 (默认: 20)")
+
+    # 如果无子命令，默认使用 status
+    if len(sys.argv) == 1:
+        cmd_status(None)
+        return
+
+    known_cmds = ["status", "sessions", "watch", "pause", "resume", "run", "service", "-h", "--help"]
+    if sys.argv[1] not in known_cmds:
+        args, unknown = parser.parse_known_args(["run"] + sys.argv[1:])
+        cmd_run(args, unknown)
+        return
+
+    args, unknown = parser.parse_known_args()
+
+    if args.subcommand == "status":
+        cmd_status(args)
+    elif args.subcommand == "sessions":
+        cmd_sessions(args)
+    elif args.subcommand == "watch":
+        cmd_watch(args)
+    elif args.subcommand == "pause":
+        cmd_pause(args)
+    elif args.subcommand == "resume":
+        cmd_resume(args)
+    elif args.subcommand == "run":
+        cmd_run(args, unknown)
+    elif args.subcommand == "service":
+        cmd_service(args)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
