@@ -348,6 +348,24 @@ class SessionManager:
         return None
 
     @classmethod
+    def get_live_thread_state(cls, thread_id: str) -> Dict[str, Any]:
+        """获取指定会话的实时运行状态（status, turns 等）"""
+        res = CodexSocketClient.query_app_server("thread/read", {"threadId": thread_id, "includeTurns": True})
+        if not res or not isinstance(res, dict):
+            return {}
+        thread = res.get("thread", {})
+        status = thread.get("status", {})
+        status_type = status.get("type") if isinstance(status, dict) else str(status)
+        turns = thread.get("turns", [])
+        last_turn = turns[-1] if turns else {}
+        return {
+            "status_type": status_type,
+            "turns_count": len(turns),
+            "last_turn_id": last_turn.get("id"),
+            "last_turn_status": last_turn.get("status"),
+        }
+
+    @classmethod
     def get_recent_sessions(cls, limit: int = 15) -> List[Dict[str, Any]]:
         """从 SQLite 获取最近的会话列表"""
         if not os.path.exists(cls.DB_PATH):
@@ -634,10 +652,21 @@ def cmd_status(args):
         print(f"\n当前活跃会话 (已锁定载入):")
         for tid in loaded_threads:
             info = SessionManager.get_thread_info(tid)
-            if info:
-                print(f"  • {bold}{info['title']}{reset} (ID: {tid[:8]}...) [工作目录: {info['cwd']}]")
+            live = SessionManager.get_live_thread_state(tid)
+            st_type = live.get("status_type", "unknown")
+            turns_cnt = live.get("turns_count", 0)
+            if st_type == "active":
+                st_badge = f"{green}运行中 (第 {turns_cnt} 轮推进中){reset}"
+            elif st_type == "idle":
+                st_badge = f"{yellow}空闲就绪 (第 {turns_cnt} 轮已完成){reset}"
+            elif turns_cnt == 0:
+                st_badge = f"新会话就绪"
             else:
-                print(f"  • 会话 ID: {tid}")
+                st_badge = f"{st_type}"
+
+            title = info['title'] if info else "(未命名任务)"
+            cwd = info['cwd'] if info else ""
+            print(f"  • {bold}{title}{reset} (ID: {tid[:8]}...) [{st_badge}] [工作目录: {cwd}]")
 
     # 检查 systemd 服务状态
     service_status = "未运行"
@@ -727,15 +756,24 @@ def cmd_resume(args):
     send_notification("Codex 已手动唤醒", f"已唤醒 {len(stopped_pids)} 个 Codex 进程，已恢复原状并继续工作。")
 
 
-def run_watch_loop(threshold: float = 3.0, interval: int = 20, continue_prompt: str = "继续"):
+def run_watch_loop(
+    threshold: float = 3.0,
+    interval: int = 10,
+    continue_prompt: str = "继续",
+    auto_continue: bool = True,
+    idle_delay: int = 5,
+):
     """核心守护监控主循环"""
-    log(f"Codex 额度守护神启动 (阈值: {threshold}%, 检查间隔: {interval}s, 唤醒指令: '{continue_prompt}')")
+    auto_desc = f"，空闲自动续跑: 开启 (延迟 {idle_delay}s)" if auto_continue else "，空闲自动续跑: 关闭"
+    log(f"Codex 额度守护神启动 (阈值: {threshold}%, 检查间隔: {interval}s, 唤醒指令: '{continue_prompt}'{auto_desc})")
     send_notification(
         "Codex 额度守护已启动",
-        f"守护监控生效中：当 5h 额度低于 {threshold}% 时自动暂停，恢复后自动唤醒原状并发送「{continue_prompt}」。",
+        f"守护监控生效中：当 5h 额度低于 {threshold}% 时自动暂停，恢复后自动唤醒原状并发送「{continue_prompt}」。{auto_desc}",
     )
 
     suspended_pids = set()
+    last_continued_turn: Dict[str, str] = {}
+    idle_since: Dict[str, float] = {}
 
     try:
         while True:
@@ -809,6 +847,40 @@ def run_watch_loop(threshold: float = 3.0, interval: int = 20, continue_prompt: 
                         urgency="normal",
                     )
 
+                # 检查空闲会话是否需要自动续跑 (Auto-Continue on Idle)
+                if auto_continue:
+                    client_pids = ProcessManager.get_codex_client_pids()
+                    running_clients = [p for p, st, _ in client_pids if st != "T"]
+                    if running_clients:
+                        loaded_threads = SessionManager.get_loaded_thread_ids()
+                        now = time.time()
+                        for tid in loaded_threads:
+                            live = SessionManager.get_live_thread_state(tid)
+                            st_type = live.get("status_type")
+                            last_turn_id = live.get("last_turn_id")
+                            last_turn_st = live.get("last_turn_status")
+
+                            if st_type == "idle" and last_turn_id:
+                                if last_turn_st == "completed" and last_continued_turn.get(tid) != last_turn_id:
+                                    if tid not in idle_since:
+                                        idle_since[tid] = now
+                                    
+                                    if now - idle_since[tid] >= idle_delay:
+                                        tinfo = SessionManager.get_thread_info(tid)
+                                        title = tinfo.get("title", tid[:8]) if tinfo else tid[:8]
+                                        log(f"🔄 [自动续跑] 会话 [{title}] (ID: {tid[:8]}...) 已完成上一回合处于空闲，自动发送「{continue_prompt}」驱动继续工作！")
+                                        success = SessionManager.send_continue_prompt(tid, continue_prompt)
+                                        if success:
+                                            last_continued_turn[tid] = last_turn_id
+                                            idle_since.pop(tid, None)
+                                            send_notification(
+                                                "Codex 自动续跑",
+                                                f"会话 [{title}] 已完成上一回合，已自动注入「{continue_prompt}」，继续自主推进！",
+                                                urgency="low",
+                                            )
+                            else:
+                                idle_since.pop(tid, None)
+
                 # 正常间隔休眠
                 time.sleep(interval)
 
@@ -827,6 +899,8 @@ def cmd_watch(args):
         threshold=args.threshold,
         interval=args.interval,
         continue_prompt=args.continue_prompt,
+        auto_continue=args.auto_continue,
+        idle_delay=args.idle_delay,
     )
 
 
@@ -907,13 +981,14 @@ def cmd_service(args):
 
     if action == "install":
         os.makedirs(os.path.dirname(SERVICE_FILE), exist_ok=True)
+        auto_flag = "" if args.auto_continue else " --no-auto-continue"
         content = f"""[Unit]
 Description=Codex Plus 5h Quota Guard Sentinel
 After=network.target
 
 [Service]
 Type=simple
-ExecStart={exec_path} watch --threshold {args.threshold} --interval {args.interval} --continue-prompt "{args.continue_prompt}"
+ExecStart={exec_path} watch --threshold {args.threshold} --interval {args.interval} --continue-prompt "{args.continue_prompt}" --idle-delay {args.idle_delay}{auto_flag}
 Restart=always
 RestartSec=10
 Environment=PATH={os.path.dirname(exec_path)}:/usr/local/bin:/usr/bin:/bin
@@ -929,7 +1004,7 @@ WantedBy=default.target
         subprocess.run(["systemctl", "--user", "restart", SERVICE_NAME], check=True)
         subprocess.run(["systemctl", "--user", "enable", SERVICE_NAME], check=True)
         print(f"\033[32m[成功] 已安装并启动系统后台服务: {SERVICE_NAME}\033[0m")
-        print("开机或用户登录时将自动常驻后台监控，恢复时将自动发送「继续」，无需手动干预！")
+        print("开机或用户登录时将自动常驻后台监控，额度恢复或回合空闲时将自动发送「继续」，无需手动干预！")
 
     elif action == "uninstall":
         subprocess.run(["systemctl", "--user", "stop", SERVICE_NAME], check=False)
@@ -959,8 +1034,11 @@ def main():
     # watch
     p_watch = subparsers.add_parser("watch", help="在前台启动守护监视器")
     p_watch.add_argument("--threshold", type=float, default=3.0, help="额度剩余百分比阈值 (默认: 3.0)")
-    p_watch.add_argument("--interval", type=int, default=20, help="监控轮询间隔秒数 (默认: 20)")
-    p_watch.add_argument("--continue-prompt", type=str, default="继续", help="恢复时向会话自动发送的指令 (默认: '继续')")
+    p_watch.add_argument("--interval", type=int, default=10, help="监控轮询间隔秒数 (默认: 10)")
+    p_watch.add_argument("--continue-prompt", type=str, default="继续", help="恢复或空闲时向会话自动发送的指令 (默认: '继续')")
+    p_watch.add_argument("--auto-continue", dest="auto_continue", action="store_true", default=True, help="当 Codex 回合结束空闲时自动发送「继续」(默认开启)")
+    p_watch.add_argument("--no-auto-continue", dest="auto_continue", action="store_false", help="禁用回合空闲时自动发送「继续」")
+    p_watch.add_argument("--idle-delay", type=int, default=5, help="检测到空闲后等待的缓冲秒数 (默认: 5s)")
 
     # pause
     subparsers.add_parser("pause", help="手动暂停正在运行的 Codex 客户端进程并记录快照")
@@ -981,8 +1059,11 @@ def main():
     p_service = subparsers.add_parser("service", help="管理 systemd 守护服务 (install / uninstall / status)")
     p_service.add_argument("action", choices=["install", "uninstall", "status"], help="操作")
     p_service.add_argument("--threshold", type=float, default=3.0, help="额度剩余百分比阈值 (默认: 3.0)")
-    p_service.add_argument("--interval", type=int, default=20, help="监控轮询间隔秒数 (默认: 20)")
-    p_service.add_argument("--continue-prompt", type=str, default="继续", help="恢复时发送的指令 (默认: '继续')")
+    p_service.add_argument("--interval", type=int, default=10, help="监控轮询间隔秒数 (默认: 10)")
+    p_service.add_argument("--continue-prompt", type=str, default="继续", help="恢复或空闲时向会话自动发送的指令 (默认: '继续')")
+    p_service.add_argument("--auto-continue", dest="auto_continue", action="store_true", default=True, help="当 Codex 回合结束空闲时自动发送「继续」(默认开启)")
+    p_service.add_argument("--no-auto-continue", dest="auto_continue", action="store_false", help="禁用回合空闲时自动发送「继续」")
+    p_service.add_argument("--idle-delay", type=int, default=5, help="检测到空闲后等待的缓冲秒数 (默认: 5s)")
 
     # 如果无子命令，默认使用 status
     if len(sys.argv) == 1:

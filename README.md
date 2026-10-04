@@ -30,7 +30,9 @@
 - 🔄 **原状无缝恢复（Session & Locks 保全）**：
   - 不采用粗暴的 kill 进程方案，使用内核挂起/唤醒，终端画面、RAM 内存、活跃任务不丢。
   - 自动快照记录会话 ID、标题、路径，自动校验并清理无进程占用的死锁（Writer Locks），**会话列表与任务进度完整无损**。
-- ⚡ **自动注入「继续」指令**：当 5h 额度恢复唤醒后，守护程序利用 Codex 内部队列（`codex queue`）自动向活跃任务注入「继续」指令，任务自动恢复推进，免去人工敲回车的麻烦。
+- ⚡ **智能自主续跑（Idle Auto-Continue）与唤醒注入**：
+  - **额度恢复唤醒续跑**：当 5h 额度恢复唤醒后，守护程序自动向活跃会话注入「继续」，无缝接力执行。
+  - **回合完成自主接力**：当 Codex 跑完一个回合进入空闲（`idle`）状态，守护程序自动等待 5 秒防抖缓冲后自动发送「继续」，让长线任务（如全流程解题、代码重构调优）永不停歇自主向前推进！
 - 🔔 **桌面通知推送**：通过系统 `notify-send` 实时推送暂停预警（含预计刷新倒计时）与恢复提醒。
 - ⚙️ **Systemd 用户服务常驻**：一行命令注册为用户级后台守护服务，开机/登录自动常驻，低至 7MB 内存占用，零负担。
 - 💻 **优雅的命令行工具**：提供 `codex-quota`、`codex-guard status`、`codex-guard sessions` 等便捷命令。
@@ -119,6 +121,8 @@ codex-guard service uninstall
 Codex Guard is an automated rate-limit sentinel for users of the OpenAI Codex CLI on the Plus subscription plan.
 
 When on a Plus plan with prepaid API credits, running out of your included 5-hour rolling quota will automatically cause OpenAI to deduct paid credits from your balance. Codex Guard prevents this by monitoring quota via the internal Codex App-Server IPC socket and freezing (`SIGSTOP`) active Codex processes when remaining quota drops below a safe threshold (default **3%**). Once the quota resets, Codex Guard seamlessly unfreezes (`SIGCONT`) your tasks, restores the full session context and task list, and automatically dispatches a `"继续"` (continue) command via the internal queue so your tasks resume execution without manual intervention.
+
+Furthermore, Codex Guard includes an **Autonomous Idle Continuation Loop**: whenever an active Codex session finishes a turn and goes idle, the sentinel waits a brief 5-second buffer and automatically queues `"继续"` to keep long-running tasks driving forward autonomously!
 
 ### Key Architecture
 ```
