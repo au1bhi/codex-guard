@@ -795,7 +795,56 @@ class ProcessManager:
     """管理并监测本机上的 Codex 客户端进程"""
 
     @staticmethod
-    def get_codex_client_pids() -> List[Tuple[int, str, str]]:
+    def is_codex_client(parts: List[str]) -> bool:
+        """精准判定给定的命令行 parts 是否为一个合法的 Codex 用户交互/运行客户端进程，
+        严格排除内部 daemon/helper、本工具自身，且绝不会因为用户 Prompt 或路径包含 'codex-guard' 等关键字而误排除！
+        """
+        if not parts:
+            return False
+
+        exe = parts[0]
+        exe_base = os.path.basename(exe).lower()
+
+        # 1. 快速排除本工具自身 (codex-guard, codex-top, codex-quota)
+        if any(tool in exe_base for tool in ("codex-guard", "codex-top", "codex-quota")):
+            return False
+        if len(parts) > 1 and any(tool in os.path.basename(parts[1]).lower() for tool in ("codex-guard", "codex-top", "codex-quota")):
+            return False
+
+        # 2. 快速排除内部 helper (如 codex-code-mode-host)
+        if "code-mode-host" in exe_base:
+            return False
+
+        # 3. 判定是否为 codex 主程序调用
+        is_codex = False
+        subcmd_idx = 1
+
+        if "codex" in exe_base:
+            is_codex = True
+            subcmd_idx = 1
+        else:
+            # 处理通过解释器或启动器调用的情况 (例如 python3 /path/to/codex, env codex, etc.)
+            for idx in (1, 2):
+                if idx < len(parts) and "codex" in os.path.basename(parts[idx]).lower():
+                    cand = os.path.basename(parts[idx]).lower()
+                    if not any(tool in cand for tool in ("codex-guard", "codex-top", "codex-quota")):
+                        is_codex = True
+                        subcmd_idx = idx + 1
+                        break
+
+        if not is_codex:
+            return False
+
+        # 4. 排除 codex 自身的内部子命令 (app-server, daemon)
+        if subcmd_idx < len(parts):
+            subcmd = parts[subcmd_idx].lower()
+            if subcmd in ("app-server", "daemon", "internal-daemon"):
+                return False
+
+        return True
+
+    @classmethod
+    def get_codex_client_pids(cls) -> List[Tuple[int, str, str]]:
         """获取所有正在运行的 Codex 客户端进程 (排除 daemon, helper 和自身)
         返回: [(pid, state, cmdline)]
         state: 'T' 为已被挂起暂停, 'S'/'R' 为正在运行
@@ -816,16 +865,10 @@ class ProcessManager:
                 if not parts:
                     continue
 
-                exe = parts[0]
+                if not cls.is_codex_client(parts):
+                    continue
+
                 cmd_full = " ".join(parts)
-
-                # 必须包含 codex
-                if "codex" not in exe.lower() and not any("codex" in p.lower() for p in parts[:2]):
-                    continue
-
-                # 排除内部守护进程、服务以及监控控制台
-                if any(x in cmd_full for x in ["app-server", "daemon", "code-mode-host", "quota-guard", "codex-guard", "codex-top", "codex-quota"]):
-                    continue
 
                 # 读取状态
                 stat_path = os.path.join(pid_dir, "stat")
@@ -1417,6 +1460,26 @@ class CodexTopDashboard:
         self._stop_event = threading.Event()
         self._force_refresh_event = threading.Event()
         self._worker_thread = None
+        try:
+            self.init_mtime = os.path.getmtime(os.path.realpath(__file__))
+        except Exception:
+            self.init_mtime = 0.0
+
+    def check_and_reload(self) -> bool:
+        """若检测到磁盘上的脚本文件被更新，自动重新执行当前进程以热加载最新逻辑"""
+        try:
+            cur_path = os.path.realpath(__file__)
+            if os.path.exists(cur_path) and os.path.getmtime(cur_path) > self.init_mtime:
+                try:
+                    if curses and not curses.isendwin():
+                        curses.endwin()
+                except Exception:
+                    pass
+                os.execv(sys.executable, [sys.executable, cur_path] + sys.argv[1:])
+                return True
+        except Exception:
+            pass
+        return False
 
     def set_flash(self, msg: str):
         self.flash_message = msg
@@ -1501,23 +1564,27 @@ class CodexTopDashboard:
             proc_metrics.append(m)
 
         loaded_threads = SessionManager.get_loaded_thread_ids()
+        sorted_threads = sorted(loaded_threads, key=lambda tid: 1 if SessionManager.is_subagent(tid) else 0)
         threads_info = []
-        for tid in loaded_threads:
+        for idx, tid in enumerate(sorted_threads):
             info = SessionManager.get_thread_info(tid)
             live = SessionManager.get_live_thread_state(tid)
-            res = CodexSocketClient.query_app_server("thread/read", {"threadId": tid, "includeTurns": True})
+            need_turns = (idx == 0)
             turns = []
-            if res and isinstance(res, dict) and "thread" in res:
-                turns = res["thread"].get("turns", [])
+            if need_turns:
+                res = CodexSocketClient.query_app_server("thread/read", {"threadId": tid, "includeTurns": True})
+                if res and isinstance(res, dict) and "thread" in res:
+                    turns = res["thread"].get("turns", [])
             threads_info.append({
                 "id": tid,
                 "title": info.get("title", "(未命名任务)") if info else "(未命名任务)",
                 "cwd": info.get("cwd", "") if info else "",
                 "status_type": live.get("status_type", "unknown"),
-                "turns_count": len(turns),
+                "turns_count": len(turns) if turns else (live.get("turns_count") or 0),
                 "last_turn_id": live.get("last_turn_id"),
                 "last_turn_status": live.get("last_turn_status"),
                 "turns": turns,
+                "is_subagent": SessionManager.is_subagent(tid),
             })
 
         try:
@@ -1602,11 +1669,19 @@ class CodexTopDashboard:
                 th_title = p["cmd"][:35]
                 turns_cnt = "-"
                 turn_st = "-"
-                if d["threads"]:
-                    t0 = d["threads"][0]
-                    th_title = t0["title"]
-                    turns_cnt = str(t0["turns_count"])
-                    turn_st = str(t0["last_turn_status"] or t0["status_type"])
+                matched_thread = None
+                for th in d.get("threads", []):
+                    if th["id"] in p["cmd"]:
+                        matched_thread = th
+                        break
+                if not matched_thread and d.get("threads"):
+                    root_threads = [th for th in d["threads"] if not th.get("is_subagent", False)]
+                    matched_thread = root_threads[0] if root_threads else d["threads"][0]
+
+                if matched_thread:
+                    th_title = matched_thread["title"]
+                    turns_cnt = str(matched_thread["turns_count"])
+                    turn_st = str(matched_thread["last_turn_status"] or matched_thread["status_type"])
 
                 cpu_fmt = f"{p['cpu_pct']:.1f}%"
                 mem_fmt = f"{p['mem_mb']:.1f}M"
@@ -1739,17 +1814,25 @@ class CodexTopDashboard:
             cur_row += 1
         else:
             for p in data["processes"]:
-                if cur_row >= maxy - 9:
+                if cur_row >= maxy - 4:
                     break
                 st_attr = c_pair(3) | curses.A_BOLD if p["state"] == "T" else c_pair(1) | curses.A_BOLD
                 th_title = p["cmd"][:45]
                 turns_cnt = "-"
                 turn_st = "-"
-                if data["threads"]:
-                    t0 = data["threads"][0]
-                    th_title = t0["title"]
-                    turns_cnt = str(t0["turns_count"])
-                    turn_st = str(t0["last_turn_status"] or t0["status_type"])
+                matched_thread = None
+                for th in data.get("threads", []):
+                    if th["id"] in p["cmd"]:
+                        matched_thread = th
+                        break
+                if not matched_thread and data.get("threads"):
+                    root_threads = [th for th in data["threads"] if not th.get("is_subagent", False)]
+                    matched_thread = root_threads[0] if root_threads else data["threads"][0]
+
+                if matched_thread:
+                    th_title = matched_thread["title"]
+                    turns_cnt = str(matched_thread["turns_count"])
+                    turn_st = str(matched_thread["last_turn_status"] or matched_thread["status_type"])
 
                 pad_line(cur_row, 0, "")
                 safe_addstr(cur_row, 1, f"{p['pid']:<8}")
@@ -1764,9 +1847,18 @@ class CodexTopDashboard:
         # 4. 实时执行流（Turn Stream）
         pad_line(cur_row, 0, "")
         cur_row += 1
-        if data["threads"] and cur_row < maxy - 5:
-            t0 = data["threads"][0]
-            turns = t0["turns"]
+        if data["threads"] and cur_row < maxy - 4:
+            target_th = None
+            if data.get("processes"):
+                for th in data["threads"]:
+                    if th["id"] in data["processes"][0]["cmd"]:
+                        target_th = th
+                        break
+            if not target_th:
+                root_threads = [th for th in data["threads"] if not th.get("is_subagent", False)]
+                target_th = root_threads[0] if root_threads else data["threads"][0]
+
+            turns = target_th["turns"] if target_th else []
             if turns:
                 last_turn = turns[-1]
                 items = last_turn.get("items", [])
@@ -1892,7 +1984,8 @@ class CodexTopDashboard:
                     stdscr.erase()
                     needs_redraw = True
                 elif ch in (ord('r'), ord('R')):
-                    self.set_flash("正在强制刷新数据...")
+                    self.set_flash("正在刷新数据...")
+                    self.check_and_reload()
                     self.trigger_background_refresh()
                     needs_redraw = True
                 elif ch in (ord('p'), ord('P')):
@@ -2030,7 +2123,8 @@ class CodexTopDashboard:
                         if ch in ('q', 'Q', '\x1b'):
                             break
                         elif ch in ('r', 'R'):
-                            self.set_flash("正在强制刷新数据...")
+                            self.set_flash("正在刷新数据...")
+                            self.check_and_reload()
                             self.trigger_background_refresh()
                             last_refresh = 0.0
                         elif ch in ('p', 'P'):

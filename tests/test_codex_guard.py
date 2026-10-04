@@ -195,26 +195,40 @@ class TestSessionManager(unittest.TestCase):
 
 class TestProcessManager(unittest.TestCase):
     def test_process_exclusion_rules(self):
-        # Verify that internal daemons and codex-top are never targeted
+        # 1. 验证内部 daemon、helper 及 codex-top 必须被排除
         excluded_cmds = [
-            "python3 /home/user/.local/bin/codex-top",
-            "codex-top",
-            "codex app-server --listen unix:// --managed-daemon",
-            "/bin/codex app-server daemon pid-update-loop",
-            "codex-code-mode-host",
-            "python3 /home/user/.local/bin/codex-guard watch",
+            ["python3", "/home/user/.local/bin/codex-top"],
+            ["codex-top"],
+            ["/home/user/.local/bin/codex-guard", "watch"],
+            ["python3", "/home/user/.local/bin/codex-guard", "watch"],
+            ["codex", "app-server", "--listen", "unix://--managed-daemon"],
+            ["/bin/codex", "app-server", "daemon", "pid-update-loop"],
+            ["codex-code-mode-host"],
+            ["/usr/bin/codex-code-mode-host"],
+            ["git", "commit", "-m", "fix codex bug"],
+            ["bash", "build.sh"],
         ]
-        for cmd in excluded_cmds:
-            self.assertTrue(
-                any(x in cmd for x in ["app-server", "daemon", "code-mode-host", "quota-guard", "codex-guard", "codex-top", "codex-quota"]),
-                f"Command '{cmd}' should be excluded from suspend targets"
+        for parts in excluded_cmds:
+            self.assertFalse(
+                cg.ProcessManager.is_codex_client(parts),
+                f"Parts {parts} should be excluded from codex client detection"
             )
 
-        # Real codex client command should NOT be excluded
-        client_cmd = "codex resume 01a0f0c8-5afb-7b13-9986-23fecae1b2bd 继续"
-        self.assertFalse(
-            any(x in client_cmd for x in ["app-server", "daemon", "code-mode-host", "quota-guard", "codex-guard", "codex-top", "codex-quota"])
-        )
+        # 2. 真实用户 Codex 交互客户端必须被精准检测（且绝不受用户 Prompt 或路径包含关键字的影响！）
+        valid_cmds = [
+            ["codex", "resume", "01a0f0c8-5afb-7b13-9986-23fecae1b2bd", "继续"],
+            ["/home/lizhonghu/.local/bin/codex", "resume", "01a0f0c8-5afb-7b13-9986-23fecae1b2bd", "继续"],
+            ["codex", "resume", "01a0f0c8", "修复 codex-guard 与 codex-top 的守护进程 bug"],
+            ["codex", "请实现一个后台 daemon 服务并连接 app-server"],
+            ["/media/lizhonghu/dATAe/Coding/codex-guard/bin/codex", "run", "pytest"],
+            ["codex", "chat"],
+            ["codex"],
+        ]
+        for parts in valid_cmds:
+            self.assertTrue(
+                cg.ProcessManager.is_codex_client(parts),
+                f"Parts {parts} must be detected as a valid Codex client"
+            )
 
 
 class TestCodexTopDashboard(unittest.TestCase):
