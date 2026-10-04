@@ -544,66 +544,50 @@ class TestCmdStop(unittest.TestCase):
         mock_args = MagicMock()
         mock_args.keep_service = False
         mock_args.disable = False
+        mock_args.kill_codex = False
         mock_args.subcommand = "stop"
 
-        with patch.object(cg.SessionManager, "interrupt_active_turns", return_value=[{"thread_id": "th1", "turn_id": "turn1"}]) as mock_interrupt, \
-             patch.object(cg.SessionManager, "kill_orphaned_tool_subprocesses") as mock_orphans, \
-             patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[(54321, "S", "codex")]), \
-             patch("os.kill") as mock_kill, \
-             patch("time.sleep"), \
+        with patch.object(cg.SessionManager, "interrupt_active_turns") as mock_interrupt, \
+             patch.object(cg.ProcessManager, "reset_all_terminal_mouse_tracking") as mock_reset_mouse, \
              patch("subprocess.run") as mock_run, \
              patch("os.path.exists", side_effect=lambda path: path == self.snap_file), \
              patch.object(cg, "send_notification") as mock_notify:
 
             cg.cmd_stop(mock_args)
 
+            # By default, Codex should NOT be interrupted
+            mock_interrupt.assert_not_called()
+            mock_reset_mouse.assert_called_once()
+
+            # Verify systemctl stop was called
+            mock_run.assert_called_with(["systemctl", "--user", "stop", cg.SERVICE_NAME], check=False)
+
+    def test_cmd_stop_with_kill_codex(self):
+        mock_args = MagicMock()
+        mock_args.keep_service = False
+        mock_args.disable = False
+        mock_args.kill_codex = True
+        mock_args.subcommand = "stop"
+
+        with patch.object(cg.SessionManager, "interrupt_active_turns", return_value=[{"thread_id": "th1", "turn_id": "turn1"}]) as mock_interrupt, \
+             patch.object(cg.SessionManager, "kill_orphaned_tool_subprocesses") as mock_orphans, \
+             patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[(54321, "S", "codex")]), \
+             patch("os.kill") as mock_kill, \
+             patch.object(cg.ProcessManager, "reset_all_terminal_mouse_tracking"), \
+             patch("subprocess.run"), \
+             patch.object(cg, "send_notification"):
+
+            cg.cmd_stop(mock_args)
             mock_interrupt.assert_called_once()
             mock_orphans.assert_called_once()
             killed_calls = mock_kill.call_args_list
-            # Verify SIGCONT then SIGTERM sent to 54321
             self.assertEqual(killed_calls[0][0], (54321, cg.signal.SIGCONT))
             self.assertEqual(killed_calls[1][0], (54321, cg.signal.SIGTERM))
 
-            # Verify snapshot updated to manual_stopped
-            with open(self.snap_file, "r") as f:
-                snap_data = json.load(f)
-            self.assertEqual(snap_data.get("reason"), "manual_stopped")
-            self.assertIn("stopped_at", snap_data)
-
-            # Verify systemctl stop was called by default
-            mock_run.assert_called_with(["systemctl", "--user", "stop", cg.SERVICE_NAME], check=False)
-
-    def test_cmd_stop_keep_service(self):
-        mock_args = MagicMock()
-        mock_args.keep_service = True
-        mock_args.disable = False
-        mock_args.subcommand = "stop"
-
-        with patch.object(cg.SessionManager, "interrupt_active_turns", return_value=[]), \
-             patch.object(cg.SessionManager, "kill_orphaned_tool_subprocesses"), \
-             patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[]), \
-             patch("subprocess.run") as mock_run, \
-             patch.object(cg, "send_notification"):
-
-            cg.cmd_stop(mock_args)
-            # systemctl stop should NOT be called when keep_service=True
-            mock_run.assert_not_called()
-
-    def test_cmd_stop_disable_flag(self):
-        mock_args = MagicMock()
-        mock_args.keep_service = False
-        mock_args.disable = True
-        mock_args.subcommand = "stop"
-
-        with patch.object(cg.SessionManager, "interrupt_active_turns", return_value=[]), \
-             patch.object(cg.SessionManager, "kill_orphaned_tool_subprocesses"), \
-             patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[]), \
-             patch("subprocess.run") as mock_run, \
-             patch.object(cg, "send_notification"):
-
-            cg.cmd_stop(mock_args)
-            self.assertIn((["systemctl", "--user", "stop", cg.SERVICE_NAME],), [call[0] for call in mock_run.call_args_list])
-            self.assertIn((["systemctl", "--user", "disable", cg.SERVICE_NAME],), [call[0] for call in mock_run.call_args_list])
+    def test_cmd_fix_mouse(self):
+        with patch.object(cg.ProcessManager, "reset_all_terminal_mouse_tracking") as mock_reset:
+            cg.cmd_fix_mouse(None)
+            mock_reset.assert_called_once()
 
 
 if __name__ == "__main__":

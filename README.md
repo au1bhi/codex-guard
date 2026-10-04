@@ -129,22 +129,24 @@ codex-guard status
 codex-guard sessions --limit 10
 ```
 
-### 3. 一键关闭 / 彻底停止（内置停止工具）
-如果你现在不需要服务，或者想立刻停止一切：
+### 3. 关闭守护程序（内置停止工具，绝不误杀 Codex）
+如果你现在不需要额度守护服务，或者想立刻关闭 codex-guard：
 ```bash
-# 专属内置关闭命令（零参数，一键关停当前任务 + 关停后台服务）
+# 专属内置关闭命令（零参数，仅关闭 codex-guard 守护程序与后台服务，完全保留 Codex 应用运行）
 codex-stop
 
-# 一键彻底关闭并禁用开机自启
+# 彻底关闭并禁用开机自启
 codex-stop --disable
 # 或
 codex-guard off
 
-# 更多灵活控制：
-codex-guard pause        # 临时挂起 (SIGSTOP) 所有运行中的 Codex 进程
-codex-guard resume       # 唤醒 (SIGCONT) 所有被暂停的 Codex 进程并发送「继续」
-codex-guard stop         # 彻底停止：掐断模型推理 + 终止客户端 + 停止后台守护服务
-codex-guard stop --keep-service # 仅掐断当前任务，保留后台守护服务继续监控
+# 紧急修复终端鼠标读取/滑动乱码问题（向所有终端重置鼠标追踪）
+codex-fix-mouse
+
+# 更多控制：
+codex-guard pause               # 临时挂起 (SIGSTOP) Codex 进程
+codex-guard resume              # 唤醒 (SIGCONT) Codex 进程并发送「继续」
+codex-guard stop --kill-codex   # 强制掐断当前运行中的 Codex 任务与客户端
 ```
 
 ### 4. 守护服务管理

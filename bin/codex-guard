@@ -882,6 +882,29 @@ class ProcessManager:
         return results
 
     @staticmethod
+    def reset_all_terminal_mouse_tracking():
+        """向所有当前打开的 PTY 终端发送注销转义符，彻底关闭鼠标事件报告"""
+        disable_seq = b"\033[?1000l\033[?1001l\033[?1002l\033[?1003l\033[?1004l\033[?1005l\033[?1006l\033[?1015l"
+        try:
+            sys.stdout.buffer.write(disable_seq)
+            sys.stdout.flush()
+        except Exception:
+            pass
+        try:
+            if os.path.exists("/dev/pts"):
+                for entry in os.listdir("/dev/pts"):
+                    if entry.isdigit():
+                        pty_path = f"/dev/pts/{entry}"
+                        try:
+                            fd = os.open(pty_path, os.O_WRONLY | os.O_NOCTTY)
+                            os.write(fd, disable_seq)
+                            os.close(fd)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    @staticmethod
     def _disable_tty_mouse(pid: int):
         """向目标进程关联的伪终端发送转义指令，禁用鼠标追踪上报，防止进程暂停后鼠标移动乱码"""
         for fd_num in (0, 1, 2):
@@ -1069,38 +1092,61 @@ def cmd_pause(args):
 
 
 def cmd_stop(args):
-    """彻底停止正在运行的 Codex 任务与客户端，掐断模型推理，并默认停止后台守护服务"""
-    # 1. 彻底掐断当前所有正在运行的回合（向 Codex App-Server 发送 turn/interrupt，立即终止 Token 推理）
-    interrupted = SessionManager.interrupt_active_turns()
-    
-    # 2. 终止孤儿工具/子进程
-    SessionManager.kill_orphaned_tool_subprocesses()
+    """彻底停止 codex-guard 本程序与后台守护服务，绝不误伤用户正常的 Codex 任务"""
+    # 1. 停止后台守护服务
+    disable_service = getattr(args, "disable", False) or getattr(args, "subcommand", "") in ("off", "disable")
+    res = subprocess.run(["systemctl", "--user", "stop", SERVICE_NAME], check=False)
+    service_stopped = True
+    service_disabled = False
+    if disable_service:
+        subprocess.run(["systemctl", "--user", "disable", SERVICE_NAME], check=False)
+        service_disabled = True
 
-    # 3. 终止所有运行中或挂起中的 Codex 客户端进程
-    pids_info = ProcessManager.get_codex_client_pids()
-    target_pids = [p for p, _, _ in pids_info]
-    
-    # 若进程处于挂起状态 (SIGSTOP)，先发 SIGCONT 再发 SIGTERM 保证能接收退出信号
-    for pid in target_pids:
-        try:
-            os.kill(pid, signal.SIGCONT)
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        except Exception as e:
-            log(f"终止进程 {pid} 异常: {e}")
+    # 2. 终止任何前台残留的 codex-guard watch 或 codex-top 进程 (绝不终止用户正常的 codex 进程！)
+    my_pid = os.getpid()
+    stopped_guard_procs = 0
+    try:
+        for pid_str in os.listdir("/proc"):
+            if not pid_str.isdigit():
+                continue
+            pid = int(pid_str)
+            if pid == my_pid:
+                continue
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmd_raw = f.read().split(b"\x00")
+                cmd_parts = [p.decode("utf-8", "ignore") for p in cmd_raw if p]
+                cmd_full = " ".join(cmd_parts)
+                # 仅匹配 codex-guard watch/top 或 codex-top 监控进程
+                if any(x in cmd_full for x in ["codex-guard watch", "codex-guard top", "codex-top"]):
+                    if not any(x in cmd_full for x in ["app-server", "code-mode-host"]):
+                        os.kill(pid, signal.SIGTERM)
+                        stopped_guard_procs += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
 
-    # 等待 0.5 秒检查是否有进程未退出，若仍存活则 SIGKILL 强杀
-    if target_pids:
-        time.sleep(0.5)
+    # 3. 立即重置并注销所有终端的鼠标追踪协议，彻底杜绝终端读取鼠标滑动乱码
+    ProcessManager.reset_all_terminal_mouse_tracking()
+
+    # 4. 仅在显式传入 --kill-codex 时才终止 Codex 应用自身
+    kill_codex = getattr(args, "kill_codex", False)
+    interrupted = []
+    target_pids = []
+    if kill_codex:
+        interrupted = SessionManager.interrupt_active_turns()
+        SessionManager.kill_orphaned_tool_subprocesses()
+        pids_info = ProcessManager.get_codex_client_pids()
+        target_pids = [p for p, _, _ in pids_info]
         for pid in target_pids:
-            if os.path.exists(f"/proc/{pid}"):
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except Exception:
-                    pass
+            try:
+                os.kill(pid, signal.SIGCONT)
+                os.kill(pid, signal.SIGTERM)
+            except Exception:
+                pass
 
-    # 4. 更新快照状态为 manual_stopped，确保后台守护不会误以为是额度耗尽而自动再次拉起！
+    # 5. 更新快照状态
     if os.path.exists(SNAPSHOT_FILE):
         try:
             with open(SNAPSHOT_FILE, "r", encoding="utf-8") as f:
@@ -1112,32 +1158,24 @@ def cmd_stop(args):
         except Exception:
             pass
 
-    # 5. 停止后台守护服务 (默认停止后台服务，除非显式传入 --keep-service)
-    keep_service = getattr(args, "keep_service", False)
-    disable_service = getattr(args, "disable", False) or getattr(args, "subcommand", "") in ("off", "disable")
-    service_stopped = False
-    service_disabled = False
-
-    if not keep_service:
-        res = subprocess.run(["systemctl", "--user", "stop", SERVICE_NAME], check=False)
-        service_stopped = True
-        if disable_service:
-            subprocess.run(["systemctl", "--user", "disable", SERVICE_NAME], check=False)
-            service_disabled = True
-
-    cnt_turns = len(interrupted)
-    cnt_pids = len(target_pids)
-    print(f"\033[32m[成功] 已彻底停止 Codex 运行与守护服务！\033[0m")
-    print(f"  • 已向 App-Server 发送中断，掐断了 {cnt_turns} 个正在运行的推理回合（Token 消耗已彻底终止）")
-    print(f"  • 已终止 {cnt_pids} 个 Codex 交互客户端进程及衍生工具子进程")
-    if service_stopped:
-        if service_disabled:
-            print(f"  • 后台守护服务 ({SERVICE_NAME}) 已停止并禁用开机自启")
-        else:
-            print(f"  • 后台守护服务 ({SERVICE_NAME}) 已停止（如需重新启用请运行 `codex-guard service start`）")
+    print(f"\033[32m[成功] 已彻底关闭并退出 codex-guard 额度守护程序！\033[0m")
+    if service_disabled:
+        print(f"  • 后台守护服务 ({SERVICE_NAME}) 已停止并禁用开机自启")
     else:
-        print(f"  • 提示：后台守护服务仍保持待机运行（因指定了 --keep-service 参数）")
-    send_notification("Codex 已彻底停止", f"已掐断 {cnt_turns} 个推理任务，终止 {cnt_pids} 个客户端，守护服务已停止。")
+        print(f"  • 后台守护服务 ({SERVICE_NAME}) 已停止（如需重新启用请运行 `codex-guard service start`）")
+    print(f"  • 已重置所有终端的鼠标追踪协议，杜绝鼠标事件读取")
+    if kill_codex:
+        print(f"  • [已按指定参数] 掐断了 {len(interrupted)} 个 Codex 任务，终止了 {len(target_pids)} 个客户端")
+    else:
+        print(f"  • 您的 Codex 应用保持原样运行，不受任何影响")
+    send_notification("codex-guard 已停止", "守护服务已完全退出，终端环境已恢复正常。")
+
+
+def cmd_fix_mouse(args):
+    """紧急修复终端鼠标读取问题，向所有终端注销鼠标追踪"""
+    ProcessManager.reset_all_terminal_mouse_tracking()
+    print(f"\033[32m[成功] 已向所有终端发送注销转义指令，鼠标追踪已彻底关闭！\033[0m")
+    print("终端将不再读取或上报任何鼠标滑动与按键乱码。")
 
 
 def cmd_resume(args):
@@ -2478,11 +2516,13 @@ def main():
 
     # stop / kill / off / disable
     for s_name in ("stop", "kill", "off", "disable"):
-        p_stop = subparsers.add_parser(s_name, help="彻底停止正在运行的 Codex 客户端与推理任务，并停止后台额度守护服务")
-        p_stop.add_argument("--keep-service", action="store_true", help="仅停止 Codex 客户端与任务，保留后台守护服务运行")
+        p_stop = subparsers.add_parser(s_name, help="彻底停止 codex-guard 本程序与后台守护服务 (默认保留 Codex 应用)")
         p_stop.add_argument("--disable", action="store_true", help="同时禁用后台守护服务的开机/登录自启")
-        p_stop.add_argument("--all", action="store_true", help="完全关闭所有（同默认行为）")
-        p_stop.add_argument("--service", action="store_true", help="停止后台守护服务（同默认行为）")
+        p_stop.add_argument("--kill-codex", action="store_true", help="可选：强制同时终止 Codex 客户端与正在运行的推理任务")
+        p_stop.add_argument("--keep-service", action="store_true", help="保留后台守护服务运行")
+
+    # fix-mouse
+    subparsers.add_parser("fix-mouse", help="紧急修复终端鼠标读取问题，向所有终端注销鼠标追踪协议")
 
     # resume
     p_resume = subparsers.add_parser("resume", help="手动唤醒被暂停的 Codex 客户端进程或恢复指定 session")
@@ -2513,13 +2553,16 @@ def main():
     elif prog_name in ("codex-stop", "stop", "codex-kill", "kill"):
         if len(sys.argv) == 1 or sys.argv[1] not in ("stop", "kill", "off", "disable", "-h", "--help"):
             sys.argv.insert(1, "stop")
+    elif prog_name in ("codex-fix-mouse", "fix-mouse"):
+        if len(sys.argv) == 1 or sys.argv[1] not in ("fix-mouse", "-h", "--help"):
+            sys.argv.insert(1, "fix-mouse")
 
     # 如果无子命令，默认使用 status
     if len(sys.argv) == 1:
         cmd_status(None)
         return
 
-    known_cmds = ["top", "status", "sessions", "watch", "pause", "stop", "kill", "off", "disable", "resume", "run", "service", "-h", "--help"]
+    known_cmds = ["top", "status", "sessions", "watch", "pause", "stop", "kill", "off", "disable", "fix-mouse", "resume", "run", "service", "-h", "--help"]
     if sys.argv[1] not in known_cmds:
         args, unknown = parser.parse_known_args(["run"] + sys.argv[1:])
         cmd_run(args, unknown)
@@ -2539,6 +2582,8 @@ def main():
         cmd_pause(args)
     elif args.subcommand in ("stop", "kill", "off", "disable"):
         cmd_stop(args)
+    elif args.subcommand == "fix-mouse":
+        cmd_fix_mouse(args)
     elif args.subcommand == "resume":
         cmd_resume(args)
     elif args.subcommand == "run":
