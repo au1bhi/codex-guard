@@ -150,6 +150,12 @@ codex-guard service uninstall
 
 ---
 
+## 🙏 致谢 (Acknowledgements)
+
+特别鸣谢 **[LINUX DO](https://linux.do/)** 社区及其热心伙伴们在思路启发、技术探讨与使用反馈中的巨大支持！LINUX DO 开放、真诚、充满极客精神的技术交流氛围，促成了本项目的诞生与不断完善。
+
+---
+
 <a name="english"></a>
 ## 🌐 English Documentation
 
@@ -173,8 +179,12 @@ Furthermore, Codex Guard includes an **Autonomous Idle Continuation Loop**: when
                                                 [ ChatGPT Backend ]
 ```
 
+### Acknowledgements
+Special thanks to the **[LINUX DO](https://linux.do/)** community for inspiration, architectural discussions, and continuous feedback!
+
 ---
 
 ## 📄 License
 
 MIT License © 2026 [Au1Bhi](https://github.com/Au1Bhi)
+
