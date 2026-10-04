@@ -1018,11 +1018,468 @@ WantedBy=default.target
         subprocess.run(["systemctl", "--user", "status", SERVICE_NAME])
 
 
+class CodexTopDashboard:
+    """类似 top/htop 的全功能实时终端控制台"""
+
+    def __init__(self, delay: float = 1.0, continue_prompt: str = "继续"):
+        self.delay = delay
+        self.continue_prompt = continue_prompt
+        self.flash_message = ""
+        self.flash_time = 0
+        self.cpu_tracker = {}  # pid -> (jiffies, timestamp)
+        self.auto_continue_enabled = True
+
+    def set_flash(self, msg: str):
+        self.flash_message = msg
+        self.flash_time = time.time()
+
+    def get_proc_metrics(self, pid: int) -> Dict[str, Any]:
+        """获取指定进程的 CPU% 与物理内存 RSS"""
+        try:
+            with open(f"/proc/{pid}/stat", "r") as f:
+                parts = f.read().split()
+            state = parts[2]
+            utime = int(parts[13])
+            stime = int(parts[14])
+            total_jiffies = utime + stime
+            rss_pages = int(parts[23])
+            mem_mb = (rss_pages * os.sysconf("SC_PAGE_SIZE")) / (1024.0 * 1024.0)
+
+            now = time.time()
+            cpu_pct = 0.0
+            if pid in self.cpu_tracker:
+                prev_jiffies, prev_time = self.cpu_tracker[pid]
+                dt = now - prev_time
+                if dt > 0.1:
+                    dj = total_jiffies - prev_jiffies
+                    clk = os.sysconf("SC_CLK_TCK")
+                    cpu_pct = max(0.0, ((dj / clk) / dt) * 100.0)
+            self.cpu_tracker[pid] = (total_jiffies, now)
+
+            return {
+                "pid": pid,
+                "state": state,
+                "state_desc": "STOPPED" if state == "T" else "RUNNING",
+                "cpu_pct": cpu_pct,
+                "mem_mb": mem_mb,
+            }
+        except Exception:
+            return {"pid": pid, "state": "S", "state_desc": "RUNNING", "cpu_pct": 0.0, "mem_mb": 0.0}
+
+    def collect_data(self) -> Dict[str, Any]:
+        """采集一次完整监控指标数据"""
+        rate_data = CodexSocketClient.query_rate_limits()
+        snap = QuotaSnapshot(rate_data) if rate_data else None
+
+        client_pids = ProcessManager.get_codex_client_pids()
+        proc_metrics = []
+        for p, st, cmd in client_pids:
+            m = self.get_proc_metrics(p)
+            m["cmd"] = cmd
+            proc_metrics.append(m)
+
+        loaded_threads = SessionManager.get_loaded_thread_ids()
+        threads_info = []
+        for tid in loaded_threads:
+            info = SessionManager.get_thread_info(tid)
+            live = SessionManager.get_live_thread_state(tid)
+            res = CodexSocketClient.query_app_server("thread/read", {"threadId": tid, "includeTurns": True})
+            turns = []
+            if res and isinstance(res, dict) and "thread" in res:
+                turns = res["thread"].get("turns", [])
+            threads_info.append({
+                "id": tid,
+                "title": info.get("title", "(未命名任务)") if info else "(未命名任务)",
+                "cwd": info.get("cwd", "") if info else "",
+                "status_type": live.get("status_type", "unknown"),
+                "turns_count": len(turns),
+                "last_turn_id": live.get("last_turn_id"),
+                "last_turn_status": live.get("last_turn_status"),
+                "turns": turns,
+            })
+
+        try:
+            with open("/proc/uptime", "r") as f:
+                sec = float(f.read().split()[0])
+            up_str = f"up {int(sec//3600)}h {int((sec%3600)//60)}m"
+        except Exception:
+            up_str = "up"
+        try:
+            l1, l5, l15 = os.getloadavg()
+            load_str = f"{l1:.2f}, {l5:.2f}, {l15:.2f}"
+        except Exception:
+            load_str = "N/A"
+
+        service_active = False
+        service_pid = "N/A"
+        try:
+            res = subprocess.run(["systemctl", "--user", "is-active", SERVICE_NAME], capture_output=True, text=True, timeout=1)
+            service_active = (res.stdout.strip() == "active")
+            if service_active:
+                res_p = subprocess.run(["systemctl", "--user", "show", "--property", "MainPID", SERVICE_NAME], capture_output=True, text=True, timeout=1)
+                line = res_p.stdout.strip()
+                if line.startswith("MainPID="):
+                    service_pid = line.split("=")[1]
+        except Exception:
+            pass
+
+        return {
+            "snapshot": snap,
+            "processes": proc_metrics,
+            "threads": threads_info,
+            "uptime": up_str,
+            "load": load_str,
+            "service_active": service_active,
+            "service_pid": service_pid,
+            "time_str": time.strftime("%H:%M:%S"),
+        }
+
+    def render_batch(self, out=sys.stdout):
+        """非交互式终端/管道直接输出单帧快照"""
+        d = self.collect_data()
+        snap = d["snapshot"]
+
+        BOLD = "\033[1m"
+        RESET = "\033[0m"
+        GREEN = "\033[32m"
+        YELLOW = "\033[33m"
+        RED = "\033[31m"
+        CYAN = "\033[36m"
+        BG_CYAN = "\033[46;30m"
+        BG_GRAY = "\033[47;30m"
+        DIM = "\033[2m"
+
+        def make_bar(used, width=28):
+            u = max(0, min(width, int(round((used/100.0)*width))))
+            return "█"*u + "░"*(width - u)
+
+        st_color = GREEN if d["service_active"] else YELLOW
+        st_desc = f"ACTIVE (PID {d['service_pid']})" if d["service_active"] else "INACTIVE"
+        out.write(f"{BG_CYAN} codex-top {RESET} - {BOLD}{d['time_str']}{RESET} {d['uptime']}, load: {d['load']}, Sentinel: {st_color}{st_desc}{RESET}\n")
+
+        if snap:
+            rem = snap.remaining_percent
+            q_color = RED if rem <= 3.0 else (YELLOW if rem <= 15.0 else GREEN)
+            b_5h = make_bar(snap.used_percent)
+            out.write(f"5h Quota:   [{q_color}{b_5h}{RESET}] {snap.used_percent:.1f}% used | {BOLD}{q_color}{rem:.1f}% left{RESET} (Reset: {snap.reset_datetime_str} in {snap.time_to_reset_str})\n")
+
+            if snap.weekly_window:
+                w_used = float(snap.weekly_window.get("usedPercent", 0))
+                w_rem = max(0.0, 100.0 - w_used)
+                b_wk = make_bar(w_used)
+                out.write(f"Week Quota: [{CYAN}{b_wk}{RESET}] {w_used:.1f}% used | {w_rem:.1f}% left | Credits: {BOLD}{snap.credit_balance}{RESET} ({GREEN}SAFE - 0 used{RESET})\n")
+
+            auto_st = f"{GREEN}ON (5s debounce){RESET}" if self.auto_continue_enabled else f"{YELLOW}OFF{RESET}"
+            out.write(f"Guard Rule: Threshold <= {BOLD}3.0%{RESET} (SIGSTOP) | Auto-Continue: {auto_st} | Plan: {BOLD}{snap.plan_type.upper()}{RESET}\n\n")
+
+        out.write(f"{BG_GRAY} PID      STATE     CPU%   MEM     TURNS  STATUS       ACTIVE SESSION / TASK TITLE                  {RESET}\n")
+        if not d["processes"]:
+            out.write(" (No active Codex client process detected)\n")
+        else:
+            for p in d["processes"]:
+                st_str = f"{RED}STOPPED{RESET}" if p["state"] == "T" else f"{GREEN}RUNNING{RESET}"
+                th_title = p["cmd"][:35]
+                turns_cnt = "-"
+                turn_st = "-"
+                if d["threads"]:
+                    t0 = d["threads"][0]
+                    th_title = t0["title"]
+                    turns_cnt = str(t0["turns_count"])
+                    turn_st = str(t0["last_turn_status"] or t0["status_type"])
+
+                cpu_fmt = f"{p['cpu_pct']:.1f}%"
+                mem_fmt = f"{p['mem_mb']:.1f}M"
+                out.write(f" {p['pid']:<8} {st_str:<17} {cpu_fmt:<6} {mem_fmt:<7} #{turns_cnt:<5} {turn_st:<12} {th_title[:45]}\n")
+
+        out.write("\n")
+        if d["threads"]:
+            t0 = d["threads"][0]
+            turns = t0["turns"]
+            if turns:
+                last_turn = turns[-1]
+                items = last_turn.get("items", [])
+                t_idx = len(turns)
+                t_st = last_turn.get("status", "inProgress")
+                st_color = GREEN if t_st == "inProgress" else YELLOW
+                out.write(f"{DIM}─── Live Turn Execution Stream (Turn #{t_idx} ─ {st_color}{t_st}{RESET}{DIM}, {len(items)} actions) ────────────────────────{RESET}\n")
+                for it in items[-8:]:
+                    itype = it.get("type")
+                    if itype == "commandExecution":
+                        c_st = it.get("status", "running")
+                        cmd_txt = it.get("command", "").replace("\n", " ").strip()
+                        c_color = GREEN if c_st == "completed" else (RED if c_st == "failed" else YELLOW)
+                        dur = f"{it.get('durationMs', 0)}ms" if it.get("durationMs") else ""
+                        out.write(f"  • {BOLD}[CMD:{c_color}{c_st}{RESET}{BOLD}]{RESET} {cmd_txt[:70]} {DIM}{dur}{RESET}\n")
+                    elif itype == "reasoning":
+                        out.write(f"  • {CYAN}[REASONING]{RESET} Deep model reasoning & kernel latency analysis...\n")
+                    elif itype == "webSearch":
+                        out.write(f"  • {YELLOW}[SEARCH]{RESET} {it.get('query', '')[:65]}\n")
+                    elif itype == "message":
+                        content = str(it.get("content", "")).replace("\n", " ")[:65]
+                        out.write(f"  • {DIM}[MSG]{RESET} {content}\n")
+
+        out.write(f"\n{DIM}───────────────────────────────────────────────────────────────────────────────{RESET}\n")
+        out.write(f" {BOLD}[q]{RESET} 退出  {BOLD}[r]{RESET} 刷新  {BOLD}[p]{RESET} 暂停  {BOLD}[c]{RESET} 唤醒  {BOLD}[Space]{RESET} 注入「继续」  {BOLD}[+/-]{RESET} 调频 ({self.delay:.1f}s)\n")
+        out.flush()
+
+    def run_curses(self, stdscr):
+        """交互式实时全屏 Curses TUI 运行循环"""
+        try:
+            curses.curs_set(0)
+        except Exception:
+            pass
+        try:
+            curses.use_default_colors()
+        except Exception:
+            pass
+
+        curses.init_pair(1, curses.COLOR_GREEN, -1)
+        curses.init_pair(2, curses.COLOR_YELLOW, -1)
+        curses.init_pair(3, curses.COLOR_RED, -1)
+        curses.init_pair(4, curses.COLOR_CYAN, -1)
+        curses.init_pair(5, curses.COLOR_MAGENTA, -1)
+        curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_CYAN)   # Title banner
+        curses.init_pair(7, curses.COLOR_BLACK, curses.COLOR_WHITE)  # Table header
+        curses.init_pair(8, curses.COLOR_WHITE, curses.COLOR_RED)    # Alert banner
+
+        stdscr.nodelay(True)
+        stdscr.timeout(int(self.delay * 1000))
+
+        last_refresh = 0.0
+
+        def safe_addstr(y, x, s, attr=0):
+            maxy, maxx = stdscr.getmaxyx()
+            if y < 0 or y >= maxy or x < 0 or x >= maxx:
+                return
+            avail = maxx - x
+            if avail <= 0:
+                return
+            try:
+                stdscr.addnstr(y, x, s, avail - 1, attr)
+            except curses.error:
+                pass
+
+        while True:
+            now = time.time()
+            if now - last_refresh >= self.delay:
+                data = self.collect_data()
+                last_refresh = now
+
+                stdscr.erase()
+                maxy, maxx = stdscr.getmaxyx()
+
+                # 1. 顶部 Header
+                snap = data["snapshot"]
+                safe_addstr(0, 0, " codex-top ", curses.color_pair(6) | curses.A_BOLD)
+                st_color = curses.color_pair(1) if data["service_active"] else curses.color_pair(2)
+                st_desc = f"ACTIVE (PID {data['service_pid']})" if data["service_active"] else "INACTIVE"
+                safe_addstr(0, 11, f" - {data['time_str']} {data['uptime']}, load: {data['load']}, Sentinel: ")
+                safe_addstr(0, 11 + len(f" - {data['time_str']} {data['uptime']}, load: {data['load']}, Sentinel: "), st_desc, st_color | curses.A_BOLD)
+
+                # 2. 额度进度条
+                if snap:
+                    bar_w = min(28, max(10, maxx - 52))
+                    def make_bar_txt(used, width):
+                        u = max(0, min(width, int(round((used/100.0)*width))))
+                        return "█"*u, "░"*(width - u)
+
+                    rem = snap.remaining_percent
+                    q_attr = curses.color_pair(3) if rem <= 3.0 else (curses.color_pair(2) if rem <= 15.0 else curses.color_pair(1))
+                    u_chars, r_chars = make_bar_txt(snap.used_percent, bar_w)
+
+                    safe_addstr(1, 0, "5h Quota:   [")
+                    safe_addstr(1, 13, u_chars, q_attr | curses.A_BOLD)
+                    safe_addstr(1, 13 + len(u_chars), r_chars, curses.A_DIM)
+                    safe_addstr(1, 13 + bar_w, f"] {snap.used_percent:.1f}% used | {rem:.1f}% left (Reset: {snap.reset_datetime_str} in {snap.time_to_reset_str})")
+
+                    if snap.weekly_window:
+                        w_used = float(snap.weekly_window.get("usedPercent", 0))
+                        w_rem = max(0.0, 100.0 - w_used)
+                        wu_chars, wr_chars = make_bar_txt(w_used, bar_w)
+                        safe_addstr(2, 0, "Week Quota: [")
+                        safe_addstr(2, 13, wu_chars, curses.color_pair(4) | curses.A_BOLD)
+                        safe_addstr(2, 13 + len(wu_chars), wr_chars, curses.A_DIM)
+                        safe_addstr(2, 13 + bar_w, f"] {w_used:.1f}% used | {w_rem:.1f}% left | Credits: {snap.credit_balance} (SAFE - 0 used)")
+
+                    auto_str = "ON (5s debounce)" if self.auto_continue_enabled else "OFF"
+                    safe_addstr(3, 0, f"Guard Rule: Threshold <= 3.0% (SIGSTOP) | Auto-Continue: {auto_str} | Plan: {snap.plan_type.upper()}")
+
+                # 3. 进程表格
+                header_row = 5
+                header_txt = f" {'PID':<8} {'STATE':<9} {'CPU%':<6} {'MEM':<7} {'TURNS':<6} {'STATUS':<12} {'ACTIVE SESSION / TASK TITLE':<{max(10, maxx-52)}} "
+                safe_addstr(header_row, 0, header_txt, curses.color_pair(7) | curses.A_BOLD)
+
+                cur_row = 6
+                if not data["processes"]:
+                    safe_addstr(cur_row, 2, "(No active Codex client process detected)", curses.A_DIM)
+                    cur_row += 1
+                else:
+                    for p in data["processes"]:
+                        if cur_row >= maxy - 9:
+                            break
+                        st_attr = curses.color_pair(3) | curses.A_BOLD if p["state"] == "T" else curses.color_pair(1) | curses.A_BOLD
+                        th_title = p["cmd"][:45]
+                        turns_cnt = "-"
+                        turn_st = "-"
+                        if data["threads"]:
+                            t0 = data["threads"][0]
+                            th_title = t0["title"]
+                            turns_cnt = str(t0["turns_count"])
+                            turn_st = str(t0["last_turn_status"] or t0["status_type"])
+
+                        safe_addstr(cur_row, 1, f"{p['pid']:<8}")
+                        safe_addstr(cur_row, 10, f"{p['state_desc']:<9}", st_attr)
+                        safe_addstr(cur_row, 20, f"{p['cpu_pct']:>4.1f}% ")
+                        safe_addstr(cur_row, 27, f"{p['mem_mb']:>5.1f}M ")
+                        safe_addstr(cur_row, 35, f"#{turns_cnt:<5}")
+                        safe_addstr(cur_row, 42, f"{turn_st:<12}")
+                        safe_addstr(cur_row, 55, th_title[:max(10, maxx-56)])
+                        cur_row += 1
+
+                # 4. 实时执行流（Turn Stream）
+                cur_row += 1
+                if data["threads"] and cur_row < maxy - 5:
+                    t0 = data["threads"][0]
+                    turns = t0["turns"]
+                    if turns:
+                        last_turn = turns[-1]
+                        items = last_turn.get("items", [])
+                        t_idx = len(turns)
+                        t_st = last_turn.get("status", "inProgress")
+                        
+                        div_title = f"─── Live Turn Execution Stream (Turn #{t_idx} ─ {t_st}, {len(items)} actions) "
+                        div_full = div_title + "─" * max(0, maxx - len(div_title) - 1)
+                        safe_addstr(cur_row, 0, div_full, curses.A_DIM)
+                        cur_row += 1
+
+                        avail_rows = maxy - cur_row - 3
+                        disp_items = items[-avail_rows:] if avail_rows > 0 else []
+                        for it in disp_items:
+                            if cur_row >= maxy - 2:
+                                break
+                            itype = it.get("type")
+                            if itype == "commandExecution":
+                                c_st = it.get("status", "running")
+                                cmd_txt = it.get("command", "").replace("\n", " ").strip()
+                                c_color = curses.color_pair(1) if c_st == "completed" else (curses.color_pair(3) if c_st == "failed" else curses.color_pair(2))
+                                dur = f"{it.get('durationMs', 0)}ms" if it.get("durationMs") else ""
+                                safe_addstr(cur_row, 2, "• [CMD:", curses.A_BOLD)
+                                safe_addstr(cur_row, 8, c_st, c_color | curses.A_BOLD)
+                                safe_addstr(cur_row, 8 + len(c_st), f"] {cmd_txt[:max(10, maxx-25)]} ")
+                                if dur:
+                                    safe_addstr(cur_row, min(maxx - len(dur) - 2, 8 + len(c_st) + len(cmd_txt) + 3), dur, curses.A_DIM)
+                            elif itype == "reasoning":
+                                safe_addstr(cur_row, 2, "• [REASONING] ", curses.color_pair(4) | curses.A_BOLD)
+                                safe_addstr(cur_row, 16, f"Deep model reasoning & kernel latency analysis... ({t0['title'][:25]})", curses.A_DIM)
+                            elif itype == "webSearch":
+                                safe_addstr(cur_row, 2, "• [SEARCH] ", curses.color_pair(2) | curses.A_BOLD)
+                                safe_addstr(cur_row, 13, it.get("query", "")[:max(10, maxx-16)])
+                            elif itype == "message":
+                                content = str(it.get("content", "")).replace("\n", " ")[:max(10, maxx-16)]
+                                safe_addstr(cur_row, 2, "• [MSG] ", curses.A_DIM)
+                                safe_addstr(cur_row, 10, content)
+                            cur_row += 1
+
+                # 5. 底部快捷栏与状态通知
+                footer_y = maxy - 1
+                sep_y = maxy - 2
+                safe_addstr(sep_y, 0, "─" * (maxx - 1), curses.A_DIM)
+
+                if self.flash_message and (now - self.flash_time < 3.0):
+                    safe_addstr(footer_y, 1, f">>> {self.flash_message}", curses.color_pair(1) | curses.A_BOLD)
+                else:
+                    safe_addstr(footer_y, 1, f" [q] 退出  [r] 刷新  [p] 暂停  [c] 唤醒  [Space] 注入「{self.continue_prompt}」  [+/-] 调频 ({self.delay:.1f}s)")
+
+                stdscr.refresh()
+
+            try:
+                ch = stdscr.getch()
+            except Exception:
+                ch = -1
+
+            if ch != -1:
+                if ch in (ord('q'), ord('Q'), 27):  # ESC or q
+                    break
+                elif ch in (ord('r'), ord('R')):
+                    last_refresh = 0.0
+                    self.set_flash("正在强制刷新数据...")
+                elif ch in (ord('p'), ord('P')):
+                    pids = ProcessManager.get_codex_client_pids()
+                    active = [p for p, st, _ in pids if st != "T"]
+                    if active:
+                        SessionManager.save_snapshot(active, reason="manual_top_pause")
+                        for pid in active:
+                            ProcessManager.suspend_pid(pid)
+                        self.set_flash(f"已发送 SIGSTOP 暂停 {len(active)} 个 Codex 进程！")
+                    else:
+                        self.set_flash("没有处于运行中的 Codex 进程需要暂停。")
+                    last_refresh = 0.0
+                elif ch in (ord('c'), ord('C')):
+                    pids = ProcessManager.get_codex_client_pids()
+                    stopped = [p for p, st, _ in pids if st == "T"]
+                    if stopped:
+                        for pid in stopped:
+                            ProcessManager.resume_pid(pid)
+                        SessionManager.restore_and_verify_sessions(stopped, send_continue=True, continue_prompt=self.continue_prompt)
+                        self.set_flash(f"已唤醒 {len(stopped)} 个 Codex 进程并发送「{self.continue_prompt}」！")
+                    else:
+                        self.set_flash("没有处于暂停中的 Codex 进程需要唤醒。")
+                    last_refresh = 0.0
+                elif ch == ord(' '):
+                    loaded = SessionManager.get_loaded_thread_ids()
+                    if loaded:
+                        tid0 = loaded[0]
+                        success = SessionManager.send_continue_prompt(tid0, self.continue_prompt)
+                        if success:
+                            self.set_flash(f"已成功向活跃会话注入「{self.continue_prompt}」指令！")
+                        else:
+                            self.set_flash(f"注入「{self.continue_prompt}」失败，请查看日志。")
+                    else:
+                        self.set_flash("未检测到活跃会话。")
+                    last_refresh = 0.0
+                elif ch in (ord('+'), ord('=')):
+                    self.delay = max(0.2, self.delay - 0.2)
+                    self.set_flash(f"刷新频率调快至: {self.delay:.1f}s")
+                    stdscr.timeout(int(self.delay * 1000))
+                elif ch in (ord('-'), ord('_')):
+                    self.delay = min(10.0, self.delay + 0.5)
+                    self.set_flash(f"刷新频率调慢至: {self.delay:.1f}s")
+                    stdscr.timeout(int(self.delay * 1000))
+                elif ch in (ord('a'), ord('A')):
+                    self.auto_continue_enabled = not self.auto_continue_enabled
+                    status_str = "开启" if self.auto_continue_enabled else "关闭"
+                    self.set_flash(f"自动接力续跑已切换为: {status_str}")
+
+
+def cmd_top(args):
+    """启动类似 top/htop 的实时监控控制台"""
+    delay = getattr(args, "delay", 1.0)
+    batch = getattr(args, "batch", False)
+    prompt = getattr(args, "continue_prompt", "继续")
+    dashboard = CodexTopDashboard(delay=delay, continue_prompt=prompt)
+
+    if batch or not sys.stdout.isatty():
+        dashboard.render_batch()
+    else:
+        try:
+            curses.wrapper(dashboard.run_curses)
+        except KeyboardInterrupt:
+            pass
+        except Exception:
+            dashboard.render_batch()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Codex Plus 5h 额度守护神：低于 3% 自动暂停防扣 Credits，恢复后自动唤醒原状并发送「继续」"
     )
     subparsers = parser.add_subparsers(dest="subcommand", help="子命令")
+
+    # top
+    p_top = subparsers.add_parser("top", help="启动类似 top 的交互式实时全屏监控控制台")
+    p_top.add_argument("-d", "--delay", type=float, default=1.0, help="刷新间隔秒数 (默认: 1.0)")
+    p_top.add_argument("-b", "--batch", action="store_true", help="单次快照批处理模式 (不进入全屏交互)")
+    p_top.add_argument("--continue-prompt", type=str, default="继续", help="恢复或注入的指令 (默认: '继续')")
 
     # status
     subparsers.add_parser("status", help="查询当前 5h 额度、重置时间及守护状态")
@@ -1065,12 +1522,17 @@ def main():
     p_service.add_argument("--no-auto-continue", dest="auto_continue", action="store_false", help="禁用回合空闲时自动发送「继续」")
     p_service.add_argument("--idle-delay", type=int, default=5, help="检测到空闲后等待的缓冲秒数 (默认: 5s)")
 
+    prog_name = os.path.basename(sys.argv[0]).lower()
+    if prog_name in ("codex-top", "top"):
+        if len(sys.argv) == 1 or sys.argv[1] not in ("top", "-h", "--help"):
+            sys.argv.insert(1, "top")
+
     # 如果无子命令，默认使用 status
     if len(sys.argv) == 1:
         cmd_status(None)
         return
 
-    known_cmds = ["status", "sessions", "watch", "pause", "resume", "run", "service", "-h", "--help"]
+    known_cmds = ["top", "status", "sessions", "watch", "pause", "resume", "run", "service", "-h", "--help"]
     if sys.argv[1] not in known_cmds:
         args, unknown = parser.parse_known_args(["run"] + sys.argv[1:])
         cmd_run(args, unknown)
@@ -1078,7 +1540,9 @@ def main():
 
     args, unknown = parser.parse_known_args()
 
-    if args.subcommand == "status":
+    if args.subcommand == "top":
+        cmd_top(args)
+    elif args.subcommand == "status":
         cmd_status(args)
     elif args.subcommand == "sessions":
         cmd_sessions(args)

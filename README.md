@@ -56,6 +56,41 @@ bash scripts/install.sh
 
 ## 📖 使用指南
 
+### 0. 实时监控看板（类似 top / htop 动态大屏）
+随时随地在终端输入 `codex-top`，享受媲美 `htop` 的全屏动态监控与键盘交互控制：
+```bash
+codex-top
+# 或
+codex-guard top
+```
+**动态大屏效果**：
+```text
+ codex-top  - 11:27:08 up 140h 23m, load: 1.12, 1.22, 1.18, Sentinel: ACTIVE (PID 267180)
+5h Quota:   [████████░░░░░░░░░░░░░░░░░░░░] 29.0% used | 71.0% left (Reset: 15:24:43 in 3小时 57分钟)
+Week Quota: [████████████░░░░░░░░░░░░░░░░] 43.0% used | 57.0% left | Credits: 1311.14 (SAFE - 0 used)
+Guard Rule: Threshold <= 3.0% (SIGSTOP) | Auto-Continue: ON (5s debounce) | Plan: PLUS
+
+ PID      STATE     CPU%   MEM     TURNS  STATUS       ACTIVE SESSION / TASK TITLE                  
+ 1230483  RUNNING   4.5%   54.5M   #41    inProgress   请完成我在firefox当前打开这个页面的所有题目
+
+─── Live Turn Execution Stream (Turn #41 ─ inProgress, 35 actions) ────────────────────────
+  • [CMD:completed] python3 tools/sim_pair_fresh.py normal-h1024 build/paired-normal.o (3478ms)
+  • [CMD:completed] python3 tools/check.py (142ms)
+  • [REASONING]     Analyzing memory bank conflicts and latency...
+  • [CMD:running]   python3 tools/analyze.py normal-h127 auto
+
+───────────────────────────────────────────────────────────────────────────────
+ [q] 退出  [r] 刷新  [p] 暂停  [c] 唤醒  [Space] 注入「继续」  [+/-] 调频 (1.0s)
+```
+- **交互按键**：
+  - `[Space]`（空格键）：立即向当前活跃任务注入「继续」指令，催促 Codex 推进！
+  - `[p]`：一键内核级挂起（`SIGSTOP`）正在运行的 Codex。
+  - `[c]`：一键唤醒（`SIGCONT`）并自动继续执行。
+  - `[+]` / `[-]`：实时调整刷新频率（0.2s ~ 10s）。
+  - `[b]` / `-b` 参数：单次快照批处理输出（如 `codex-top -b`）。
+
+---
+
 ### 1. 查看当前额度与会话状态
 ```bash
 codex-quota
