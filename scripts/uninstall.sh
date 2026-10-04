@@ -20,7 +20,7 @@ fi
 echo "✓ Stopped and removed systemd service"
 
 # Remove binaries
-rm -f "${BIN_DIR}/codex-guard" "${BIN_DIR}/codex-quota" "${BIN_DIR}/codex-top"
+rm -f "${BIN_DIR}/codex-guard" "${BIN_DIR}/codex-quota" "${BIN_DIR}/codex-top" "${BIN_DIR}/codex-stop" "${BIN_DIR}/codex-kill"
 echo "✓ Removed binaries from ${BIN_DIR}"
 
 echo "=== Uninstallation Complete ==="

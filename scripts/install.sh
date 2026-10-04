@@ -13,7 +13,9 @@ cp "${DIR}/bin/codex-guard" "${BIN_DIR}/codex-guard"
 chmod +x "${BIN_DIR}/codex-guard"
 ln -sf "${BIN_DIR}/codex-guard" "${BIN_DIR}/codex-quota"
 ln -sf "${BIN_DIR}/codex-guard" "${BIN_DIR}/codex-top"
-echo "✓ Installed codex-guard, codex-quota, and codex-top to ${BIN_DIR}"
+ln -sf "${BIN_DIR}/codex-guard" "${BIN_DIR}/codex-stop"
+ln -sf "${BIN_DIR}/codex-guard" "${BIN_DIR}/codex-kill"
+echo "✓ Installed codex-guard, codex-quota, codex-top, and codex-stop to ${BIN_DIR}"
 
 # 2. Install systemd service
 mkdir -p "${SERVICE_DIR}"

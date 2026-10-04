@@ -81,7 +81,7 @@ Guard Rule: Threshold <= 3.0% (SIGSTOP) | Auto-Continue: ON (5s debounce) | Plan
   • [CMD:running]   python3 tools/analyze.py normal-h127 auto
 
 ───────────────────────────────────────────────────────────────────────────────
- [q] 退出  [r] 刷新  [p] 暂停  [c] 唤醒  [k] 停止  [Space] 注入「继续」  [+/-] 调频 (1.0s)
+ [q] 退出  [r] 刷新  [p] 暂停  [c] 唤醒  [k] 终止任务  [s] 启停服务  [Space] 注入「继续」  [+/-] 调频 (1.0s)
 ```
 - **交互按键**：
   - `[q]` / `[ESC]` / `Ctrl+C`：安全退出 `codex-top` 控制台（不会影响后台 Codex 任务）。
@@ -89,6 +89,7 @@ Guard Rule: Threshold <= 3.0% (SIGSTOP) | Auto-Continue: ON (5s debounce) | Plan
   - `[p]`：一键内核级挂起（`SIGSTOP`）正在运行的 Codex 进程。
   - `[c]`：一键唤醒（`SIGCONT`）并自动继续执行。
   - `[k]`：彻底终止（Kill/Interrupt）当前运行中的任务与客户端进程（掐断模型推理，杜绝消耗额度，防止守护服务误拉起）。
+  - `[s]`：**一键启停后台守护服务**（在控制台内实时开关 systemd Sentinel 守护服务，状态栏即时变色生效）。
   - `[+]` / `[-]`：实时调整刷新频率（0.2s ~ 10s）。
   - `[b]` / `-b` 参数：单次快照批处理输出（如 `codex-top -b`）。
 
@@ -128,26 +129,37 @@ codex-guard status
 codex-guard sessions --limit 10
 ```
 
-### 3. 手动暂停 / 恢复 / 彻底停止
-如需手动强制控制正在运行的任务：
+### 3. 一键关闭 / 彻底停止（内置停止工具）
+如果你现在不需要服务，或者想立刻停止一切：
 ```bash
+# 专属内置关闭命令（零参数，一键关停当前任务 + 关停后台服务）
+codex-stop
+
+# 一键彻底关闭并禁用开机自启
+codex-stop --disable
+# 或
+codex-guard off
+
+# 更多灵活控制：
 codex-guard pause        # 临时挂起 (SIGSTOP) 所有运行中的 Codex 进程
 codex-guard resume       # 唤醒 (SIGCONT) 所有被暂停的 Codex 进程并发送「继续」
-codex-guard stop         # 彻底停止：掐断 App-Server 模型推理 + 终止客户端进程（立即停止计费）
-codex-guard stop --all   # 一键全关：彻底停止任务 + 停止后台守护服务 codex-quota-guard
+codex-guard stop         # 彻底停止：掐断模型推理 + 终止客户端 + 停止后台守护服务
+codex-guard stop --keep-service # 仅掐断当前任务，保留后台守护服务继续监控
 ```
 
 ### 4. 守护服务管理
 ```bash
 # 查看后台守护服务运行状态与日志
 codex-guard service status
-# 或
-systemctl --user status codex-quota-guard
 
-# 停止 / 启动 / 重启守护服务
-codex-guard service stop
-codex-guard service start
-codex-guard service restart
+# 停止 / 禁用服务（不需要时）
+codex-guard service stop     # 停止服务
+codex-guard service disable  # 停止并禁用开机/登录自启
+
+# 启动 / 启用服务（需要时）
+codex-guard service start    # 启动服务
+codex-guard service enable   # 启用并启动服务
+codex-guard service restart  # 重启服务
 
 # 查看详细守护时间线日志
 tail -f ~/.codex/quota_guard.log

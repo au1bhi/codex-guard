@@ -542,14 +542,16 @@ class TestCmdStop(unittest.TestCase):
             json.dump({"pids": [1234], "reason": "low_quota"}, f)
 
         mock_args = MagicMock()
-        mock_args.all = False
-        mock_args.service = False
+        mock_args.keep_service = False
+        mock_args.disable = False
+        mock_args.subcommand = "stop"
 
         with patch.object(cg.SessionManager, "interrupt_active_turns", return_value=[{"thread_id": "th1", "turn_id": "turn1"}]) as mock_interrupt, \
              patch.object(cg.SessionManager, "kill_orphaned_tool_subprocesses") as mock_orphans, \
              patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[(54321, "S", "codex")]), \
              patch("os.kill") as mock_kill, \
              patch("time.sleep"), \
+             patch("subprocess.run") as mock_run, \
              patch("os.path.exists", side_effect=lambda path: path == self.snap_file), \
              patch.object(cg, "send_notification") as mock_notify:
 
@@ -568,10 +570,14 @@ class TestCmdStop(unittest.TestCase):
             self.assertEqual(snap_data.get("reason"), "manual_stopped")
             self.assertIn("stopped_at", snap_data)
 
-    def test_cmd_stop_with_service_flag(self):
+            # Verify systemctl stop was called by default
+            mock_run.assert_called_with(["systemctl", "--user", "stop", cg.SERVICE_NAME], check=False)
+
+    def test_cmd_stop_keep_service(self):
         mock_args = MagicMock()
-        mock_args.all = True
-        mock_args.service = False
+        mock_args.keep_service = True
+        mock_args.disable = False
+        mock_args.subcommand = "stop"
 
         with patch.object(cg.SessionManager, "interrupt_active_turns", return_value=[]), \
              patch.object(cg.SessionManager, "kill_orphaned_tool_subprocesses"), \
@@ -580,7 +586,24 @@ class TestCmdStop(unittest.TestCase):
              patch.object(cg, "send_notification"):
 
             cg.cmd_stop(mock_args)
-            mock_run.assert_called_with(["systemctl", "--user", "stop", cg.SERVICE_NAME], check=False)
+            # systemctl stop should NOT be called when keep_service=True
+            mock_run.assert_not_called()
+
+    def test_cmd_stop_disable_flag(self):
+        mock_args = MagicMock()
+        mock_args.keep_service = False
+        mock_args.disable = True
+        mock_args.subcommand = "stop"
+
+        with patch.object(cg.SessionManager, "interrupt_active_turns", return_value=[]), \
+             patch.object(cg.SessionManager, "kill_orphaned_tool_subprocesses"), \
+             patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[]), \
+             patch("subprocess.run") as mock_run, \
+             patch.object(cg, "send_notification"):
+
+            cg.cmd_stop(mock_args)
+            self.assertIn((["systemctl", "--user", "stop", cg.SERVICE_NAME],), [call[0] for call in mock_run.call_args_list])
+            self.assertIn((["systemctl", "--user", "disable", cg.SERVICE_NAME],), [call[0] for call in mock_run.call_args_list])
 
 
 if __name__ == "__main__":
