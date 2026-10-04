@@ -88,7 +88,8 @@ class TestSessionManager(unittest.TestCase):
             INSERT INTO threads VALUES 
             ('thread-001', 'Task 1: Optimize Kernels', '/tmp/proj', 1700000000, 'cli', 'gpt-5-codex', 0),
             ('thread-002', 'Task 2: Debug Crash', '/home/user', 1700000500, 'cli', 'gpt-5-codex', 0),
-            ('thread-003', 'Archived Task', '/tmp', 1600000000, 'cli', 'gpt-5-codex', 1)
+            ('thread-003', 'Archived Task', '/tmp', 1600000000, 'cli', 'gpt-5-codex', 1),
+            ('thread-sub-01', 'Subagent Worker', '/tmp/proj', 1700000600, '{"subagent": {"thread_spawn": {"parent_thread_id": "thread-001"}}}', 'gpt-5-codex', 0)
         """)
         conn.commit()
         conn.close()
@@ -156,6 +157,40 @@ class TestSessionManager(unittest.TestCase):
             # Only thread-002 should receive queue send_continue_prompt
             mock_send.assert_called_once_with("thread-002", "继续")
             self.assertEqual(len(res["sessions"]), 2)
+
+    def test_subagent_detection_and_resolution(self):
+        # thread-001 is root
+        self.assertFalse(cg.SessionManager.is_subagent("thread-001"))
+        self.assertEqual(cg.SessionManager.get_root_thread_id("thread-001"), "thread-001")
+
+        # thread-sub-01 is a subagent whose parent is thread-001
+        self.assertTrue(cg.SessionManager.is_subagent("thread-sub-01"))
+        self.assertEqual(cg.SessionManager.get_root_thread_id("thread-sub-01"), "thread-001")
+
+    def test_send_continue_prompt_skips_subagents(self):
+        with patch("subprocess.run") as mock_run:
+            # Must skip subagents without executing subprocess
+            res = cg.SessionManager.send_continue_prompt("thread-sub-01", "继续")
+            self.assertFalse(res)
+            mock_run.assert_not_called()
+
+    def test_launch_codex_session_resolves_root_thread(self):
+        with patch("subprocess.run") as mock_run, patch("shutil.which", return_value="/usr/local/bin/codex"):
+            mock_run.return_value = MagicMock(returncode=0)
+            # Launching with subagent ID should resolve to parent thread-001
+            res = cg.SessionManager.launch_codex_session("thread-sub-01", prompt="继续")
+            self.assertTrue(res)
+            mock_run.assert_called()
+            args = mock_run.call_args[0][0]
+            self.assertEqual(args[0], "gnome-terminal")
+            self.assertIn("thread-001", args[5])
+            self.assertNotIn("thread-sub-01", args[5])
+
+    def test_get_gui_env(self):
+        env = cg.get_gui_env()
+        self.assertIn("DISPLAY", env)
+        self.assertIn("XDG_RUNTIME_DIR", env)
+        self.assertIn("DBUS_SESSION_BUS_ADDRESS", env)
 
 
 class TestProcessManager(unittest.TestCase):
@@ -312,6 +347,45 @@ class TestWatchLoopSimulation(unittest.TestCase):
             with open(self.snap_file) as f:
                 snap = json.load(f)
                 self.assertEqual(snap["reason"], "quota_recovered")
+
+    def test_auto_recovery_launches_when_resumed_process_exited_immediately(self):
+        """Regression test: verify auto-launch triggers even if a suspended PID existed when running_clients is empty, and resolves subagent to root"""
+        snapshot_content = {
+            "reason": "quota_exceeded",
+            "sessions": [{"id": "thread-sub-01", "title": "Sub Task"}],
+            "interrupted_turns": [{"threadId": "thread-sub-01", "turnId": "turn-9"}],
+            "loaded_thread_ids": ["thread-sub-01"]
+        }
+        with open(self.snap_file, "w") as f:
+            json.dump(snapshot_content, f)
+
+        raw_recovered = {
+            "rateLimits": {
+                "planType": "plus",
+                "credits": {"hasCredits": True, "balance": "1311.14"},
+                "primary": {"windowDurationMins": 300, "usedPercent": 5.0, "resetsAt": int(time.time() + 18000)}
+            }
+        }
+        def fake_sleep(duration):
+            if duration == 1:
+                raise KeyboardInterrupt()
+
+        with patch.object(cg.CodexSocketClient, "query_rate_limits", return_value=raw_recovered), \
+             patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[]), \
+             patch.object(cg.SessionManager, "get_thread_info", side_effect=lambda tid: {"source": '{"subagent": {"thread_spawn": {"parent_thread_id": "thread-001"}}}'} if tid == "thread-sub-01" else {"source": "cli"}), \
+             patch.object(cg.SessionManager, "launch_codex_session", return_value=True) as mock_launch, \
+             patch.object(cg.SessionManager, "restore_and_verify_sessions") as mock_restore, \
+             patch.object(cg, "send_notification"), \
+             patch("time.sleep", side_effect=fake_sleep):
+
+            try:
+                cg.run_watch_loop(threshold=3.0, interval=1)
+            except KeyboardInterrupt:
+                pass
+
+            # Auto-launch MUST be called, and it MUST resolve thread-sub-01 to root thread-001!
+            mock_launch.assert_called_once_with("thread-001", prompt="继续")
+            mock_restore.assert_called_once()
 
     def test_auto_continue_on_idle(self):
         """Simulate idle session -> verify debouncing and send_continue_prompt"""

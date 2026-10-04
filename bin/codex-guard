@@ -51,17 +51,62 @@ def log(msg: str, print_to_stdout: bool = True):
         pass
 
 
+def get_gui_env() -> Dict[str, str]:
+    """动态检索当前系统活跃桌面会话的图形环境变量 (含 Wayland, Xwayland 授权凭据与 DBus 路径)"""
+    uid = os.getuid()
+    env = os.environ.copy()
+
+    # 1. 尝试从运行中的桌面会话进程中读取真实完整的图形环境
+    gui_procs = ['gnome-shell', 'mutter', 'kwin', 'sway', 'hyprland', 'xfce4-session', 'plasmashell', 'nautilus', 'Xwayland']
+    found = {}
+    for pid_dir in glob.glob('/proc/[0-9]*'):
+        try:
+            with open(f'{pid_dir}/cmdline', 'rb') as f:
+                cmd = f.read().decode('utf-8', errors='ignore')
+            if any(p in cmd for p in gui_procs):
+                with open(f'{pid_dir}/environ', 'rb') as f:
+                    for item in f.read().split(b'\0'):
+                        if b'=' in item:
+                            k, v = item.split(b'=', 1)
+                            ks = k.decode('utf-8', errors='ignore')
+                            if ks in ('DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY', 'DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR'):
+                                found[ks] = v.decode('utf-8', errors='ignore')
+                if 'XAUTHORITY' in found or 'WAYLAND_DISPLAY' in found:
+                    break
+        except Exception:
+            continue
+
+    env.update(found)
+
+    # 2. 如果缺少 XAUTHORITY，自动检索 /run/user/{uid}/.mutter-Xwaylandauth.* 或 ~/.Xauthority
+    if 'XAUTHORITY' not in env or not os.path.exists(env['XAUTHORITY']):
+        mutter_auth = glob.glob(f'/run/user/{uid}/.mutter-Xwaylandauth.*')
+        if mutter_auth and os.path.exists(mutter_auth[0]):
+            env['XAUTHORITY'] = mutter_auth[0]
+        elif os.path.exists(os.path.expanduser('~/.Xauthority')):
+            env['XAUTHORITY'] = os.path.expanduser('~/.Xauthority')
+
+    # 3. 如果缺少 WAYLAND_DISPLAY，自动检索 /run/user/{uid}/wayland-*
+    if 'WAYLAND_DISPLAY' not in env:
+        wayland_socks = glob.glob(f'/run/user/{uid}/wayland-[0-9]*')
+        if wayland_socks:
+            env['WAYLAND_DISPLAY'] = os.path.basename(wayland_socks[0])
+
+    if 'DISPLAY' not in env:
+        env['DISPLAY'] = ':0'
+    if 'XDG_RUNTIME_DIR' not in env:
+        env['XDG_RUNTIME_DIR'] = f'/run/user/{uid}'
+    if 'DBUS_SESSION_BUS_ADDRESS' not in env:
+        bus = f'/run/user/{uid}/bus'
+        if os.path.exists(bus):
+            env['DBUS_SESSION_BUS_ADDRESS'] = f'unix:path={bus}'
+
+    return env
+
+
 def send_notification(title: str, message: str, urgency: str = "normal"):
     """发送系统桌面通知 (通过 notify-send)"""
-    env = os.environ.copy()
-    if "DISPLAY" not in env:
-        env["DISPLAY"] = ":0"
-    if "DBUS_SESSION_BUS_ADDRESS" not in env:
-        uid = os.getuid()
-        bus_path = f"/run/user/{uid}/bus"
-        if os.path.exists(bus_path):
-            env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus_path}"
-
+    env = get_gui_env()
     try:
         subprocess.run(
             ["notify-send", "-a", "Codex Quota Guard", "-u", urgency, title, message],
@@ -384,6 +429,32 @@ class SessionManager:
         return None
 
     @classmethod
+    def is_subagent(cls, thread_id: str) -> bool:
+        """判断是否为多智能体架构衍生的子代理 (Sub-Agent，不支持直接接收用户输入或单独拉起)"""
+        info = cls.get_thread_info(thread_id)
+        if not info:
+            return False
+        source = str(info.get("source") or "")
+        return "subagent" in source.lower()
+
+    @classmethod
+    def get_root_thread_id(cls, thread_id: str) -> str:
+        """如果目标 thread_id 是子代理，溯源并返回其所属根会话 parent_thread_id；否则返回自身"""
+        info = cls.get_thread_info(thread_id)
+        if not info:
+            return thread_id
+        source = str(info.get("source") or "")
+        if "parent_thread_id" in source:
+            try:
+                data = json.loads(source)
+                parent = data.get("subagent", {}).get("thread_spawn", {}).get("parent_thread_id")
+                if parent:
+                    return cls.get_root_thread_id(parent)
+            except Exception:
+                pass
+        return thread_id
+
+    @classmethod
     def get_live_thread_state(cls, thread_id: str) -> Dict[str, Any]:
         """获取指定会话的实时运行状态（status, turns 等）"""
         res = CodexSocketClient.query_app_server("thread/read", {"threadId": thread_id, "includeTurns": True})
@@ -412,7 +483,7 @@ class SessionManager:
             c.execute(
                 """SELECT id, title, cwd, updated_at, source, model, archived
                    FROM threads 
-                   WHERE archived = 0 
+                   WHERE archived = 0 AND (source IS NULL OR source NOT LIKE '%subagent%')
                    ORDER BY updated_at DESC 
                    LIMIT ?""",
                 (limit,)
@@ -564,6 +635,9 @@ class SessionManager:
     @classmethod
     def send_continue_prompt(cls, thread_id: str, prompt: str = "继续") -> bool:
         """使用 codex queue 向指定会话发送消息（例如 '继续'）触发自动继续工作"""
+        if cls.is_subagent(thread_id):
+            log(f"跳过向子代理 [{thread_id[:8]}...] 发送指令: 多智能体 v2 子代理不接受直接外部队列输入。")
+            return False
         try:
             res = subprocess.run(
                 ["codex", "queue", "--thread", thread_id, "--message", prompt],
@@ -585,17 +659,11 @@ class SessionManager:
     @classmethod
     def launch_codex_session(cls, session_id: str, prompt: str = "继续") -> bool:
         """自动拉起并恢复指定的 Codex 会话 (优先弹出桌面终端窗口，无图形环境则回退后台终端)"""
-        env = os.environ.copy()
-        if "DISPLAY" not in env:
-            env["DISPLAY"] = ":0"
-        if "DBUS_SESSION_BUS_ADDRESS" not in env:
-            uid = os.getuid()
-            bus_path = f"/run/user/{uid}/bus"
-            if os.path.exists(bus_path):
-                env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus_path}"
-        if "XDG_RUNTIME_DIR" not in env:
-            uid = os.getuid()
-            env["XDG_RUNTIME_DIR"] = f"/run/user/{uid}"
+        # 解析根会话，避免在子代理上直接拉起
+        session_id = cls.get_root_thread_id(session_id)
+
+        # 获取系统完整图形环境变量 (含 Wayland / Xwayland 授权凭据及 DBus 路径)
+        env = get_gui_env()
 
         codex_bin = shutil.which("codex") or os.path.expanduser("~/.local/bin/codex")
         safe_bin = shlex.quote(codex_bin)
@@ -611,27 +679,33 @@ class SessionManager:
                 "--",
                 "bash", "-c", bash_cmd
             ]
-            res = subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=5)
             if res.returncode == 0:
                 log(f"🚀 [自动拉起] 已在 GNOME 终端中自动拉起 Codex 会话 [{session_id[:8]}...]！")
                 return True
+            else:
+                err_msg = res.stderr.strip() or res.stdout.strip()
+                log(f"gnome-terminal 退出异常 (code {res.returncode}): {err_msg}，尝试其他终端...")
         except Exception as e:
             log(f"gnome-terminal 拉起失败: {e}，尝试其他终端...")
 
         # 2. 尝试 x-terminal-emulator
         try:
             xterm_cmd = ["x-terminal-emulator", "-T", f"Codex - 自动恢复任务 [{session_id[:8]}]", "-e", f"bash -c {shlex.quote(bash_cmd)}"]
-            res = subprocess.run(xterm_cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            res = subprocess.run(xterm_cmd, env=env, capture_output=True, text=True, timeout=5)
             if res.returncode == 0:
                 log(f"🚀 [自动拉起] 已在 x-terminal-emulator 中自动拉起 Codex 会话 [{session_id[:8]}...]！")
                 return True
-        except Exception:
-            pass
+            else:
+                err_msg = res.stderr.strip() or res.stdout.strip()
+                log(f"x-terminal-emulator 退出异常 (code {res.returncode}): {err_msg}")
+        except Exception as e:
+            log(f"x-terminal-emulator 拉起失败: {e}")
 
         # 3. 回退到 screen 后台会话拉起
         try:
             screen_cmd = ["screen", "-dmS", f"codex-{session_id[:8]}", codex_bin, "resume", session_id, prompt]
-            res = subprocess.run(screen_cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            res = subprocess.run(screen_cmd, env=env, capture_output=True, text=True, timeout=5)
             if res.returncode == 0:
                 log(f"🚀 [自动拉起] 已在 screen 后台终端中自动拉起 Codex 会话 [{session_id[:8]}...]！")
                 return True
@@ -673,12 +747,15 @@ class SessionManager:
         target_thread_ids = set()
         for sess in saved_sessions:
             if sess.get("id"):
-                target_thread_ids.add(sess["id"])
+                target_thread_ids.add(cls.get_root_thread_id(sess["id"]))
         for iturn in interrupted_turns:
             if iturn.get("threadId"):
-                target_thread_ids.add(iturn["threadId"])
+                target_thread_ids.add(cls.get_root_thread_id(iturn["threadId"]))
         for tid in loaded_now:
-            target_thread_ids.add(tid)
+            target_thread_ids.add(cls.get_root_thread_id(tid))
+
+        # 排除多智能体架构子代理
+        target_thread_ids = {tid for tid in target_thread_ids if not cls.is_subagent(tid)}
 
         exclude_set = set(exclude_thread_ids or [])
         restored_details = []
@@ -1067,13 +1144,17 @@ def run_watch_loop(
                                 resumed_pids.append(pid)
                         suspended_pids.remove(pid)
 
+                    # 若唤醒了旧进程，给予 1 秒缓冲让其要么稳定恢复，要么因 turn 中断干净退出
+                    if resumed_pids:
+                        time.sleep(1.0)
+
                     # 检查当前是否已有正在运行的 Codex 客户端
                     client_pids = ProcessManager.get_codex_client_pids()
                     running_clients = [p for p, st, _ in client_pids if st != "T"]
 
-                    # 若当前没有运行中的客户端，说明此前被关闭/杀掉，主动执行“自动拉起”！
+                    # 若当前没有运行中的客户端，说明此前被关闭/杀掉/中断退出，主动执行“自动拉起”！
                     launched_sid = None
-                    if not running_clients and not resumed_pids:
+                    if not running_clients:
                         target_sid = None
                         # 1. 尝试从快照 sessions 检索
                         saved_sessions = snapshot_data.get("sessions", [])
@@ -1104,6 +1185,8 @@ def run_watch_loop(
                                 target_sid = recent[0]["id"]
 
                         if target_sid:
+                            # 溯源为根会话，避免在子代理上启动
+                            target_sid = SessionManager.get_root_thread_id(target_sid)
                             log(f"检测到当前无存活客户端，正在自动拉起 Codex 会话 [{target_sid[:8]}...]...")
                             if SessionManager.launch_codex_session(target_sid, prompt=continue_prompt):
                                 launched_sid = target_sid
@@ -1147,6 +1230,9 @@ def run_watch_loop(
 
                         now = time.time()
                         for tid in loaded_threads:
+                            # 过滤多智能体子代理
+                            if SessionManager.is_subagent(tid):
+                                continue
                             live = SessionManager.get_live_thread_state(tid)
                             st_type = live.get("status_type")
                             last_turn_id = live.get("last_turn_id")
@@ -1286,8 +1372,10 @@ ExecStart={exec_path} watch --threshold {args.threshold} --interval {args.interv
 Restart=always
 RestartSec=10
 Environment=PATH={os.path.dirname(exec_path)}:/usr/local/bin:/usr/bin:/bin
+PassEnvironment=DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR
 Environment=DISPLAY=:0
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{os.getuid()}/bus
+Environment=XDG_RUNTIME_DIR=/run/user/{os.getuid()}
 
 [Install]
 WantedBy=default.target
