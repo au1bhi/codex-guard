@@ -22,6 +22,10 @@ import glob
 import sqlite3
 import subprocess
 import argparse
+try:
+    import curses
+except ImportError:
+    curses = None
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -1228,19 +1232,28 @@ class CodexTopDashboard:
             curses.curs_set(0)
         except Exception:
             pass
+
         try:
             curses.use_default_colors()
+            bg_color = -1
+        except Exception:
+            bg_color = curses.COLOR_BLACK
+
+        for idx, fg in enumerate([curses.COLOR_GREEN, curses.COLOR_YELLOW, curses.COLOR_RED, curses.COLOR_CYAN, curses.COLOR_MAGENTA], 1):
+            try:
+                curses.init_pair(idx, fg, bg_color)
+            except Exception:
+                try:
+                    curses.init_pair(idx, fg, curses.COLOR_BLACK)
+                except Exception:
+                    pass
+
+        try:
+            curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_CYAN)   # Title banner
+            curses.init_pair(7, curses.COLOR_BLACK, curses.COLOR_WHITE)  # Table header
+            curses.init_pair(8, curses.COLOR_WHITE, curses.COLOR_RED)    # Alert banner
         except Exception:
             pass
-
-        curses.init_pair(1, curses.COLOR_GREEN, -1)
-        curses.init_pair(2, curses.COLOR_YELLOW, -1)
-        curses.init_pair(3, curses.COLOR_RED, -1)
-        curses.init_pair(4, curses.COLOR_CYAN, -1)
-        curses.init_pair(5, curses.COLOR_MAGENTA, -1)
-        curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_CYAN)   # Title banner
-        curses.init_pair(7, curses.COLOR_BLACK, curses.COLOR_WHITE)  # Table header
-        curses.init_pair(8, curses.COLOR_WHITE, curses.COLOR_RED)    # Alert banner
 
         stdscr.nodelay(True)
         stdscr.timeout(int(self.delay * 1000))
@@ -1450,6 +1463,78 @@ class CodexTopDashboard:
                     status_str = "开启" if self.auto_continue_enabled else "关闭"
                     self.set_flash(f"自动接力续跑已切换为: {status_str}")
 
+    def run_ansi_loop(self):
+        """ANSI 转义终端持久实时全屏循环 (在 Curses 不可用或无特殊支持时的万能实时保底)"""
+        sys.stdout.write("\033[?25l\033[?1049h")  # 隐藏光标，切换到备用屏幕缓冲
+        sys.stdout.flush()
+        old_settings = None
+        try:
+            import select
+            try:
+                import termios
+                import tty
+                if sys.stdin.isatty():
+                    old_settings = termios.tcgetattr(sys.stdin)
+                    tty.setcbreak(sys.stdin.fileno())
+            except Exception:
+                pass
+
+            last_refresh = 0.0
+            while True:
+                now = time.time()
+                if now - last_refresh >= self.delay:
+                    sys.stdout.write("\033[H\033[2J")  # 移到屏幕左上角并清屏
+                    self.render_batch(sys.stdout)
+                    last_refresh = now
+
+                # 非阻塞监听按键
+                if sys.stdin.isatty():
+                    r, _, _ = select.select([sys.stdin], [], [], min(0.2, self.delay))
+                    if r:
+                        ch = sys.stdin.read(1)
+                        if ch in ('q', 'Q', '\x1b'):
+                            break
+                        elif ch in ('r', 'R'):
+                            last_refresh = 0.0
+                        elif ch in ('p', 'P'):
+                            pids = ProcessManager.get_codex_client_pids()
+                            active = [p for p, st, _ in pids if st != "T"]
+                            for pid in active:
+                                ProcessManager.suspend_pid(pid)
+                            last_refresh = 0.0
+                        elif ch in ('c', 'C'):
+                            pids = ProcessManager.get_codex_client_pids()
+                            stopped = [p for p, st, _ in pids if st == "T"]
+                            for pid in stopped:
+                                ProcessManager.resume_pid(pid)
+                            SessionManager.restore_and_verify_sessions(stopped, send_continue=True, continue_prompt=self.continue_prompt)
+                            last_refresh = 0.0
+                        elif ch == ' ':
+                            loaded = SessionManager.get_loaded_thread_ids()
+                            if loaded:
+                                SessionManager.send_continue_prompt(loaded[0], self.continue_prompt)
+                            last_refresh = 0.0
+                        elif ch in ('+', '='):
+                            self.delay = max(0.2, self.delay - 0.2)
+                        elif ch in ('-', '_'):
+                            self.delay = min(10.0, self.delay + 0.5)
+                        elif ch in ('a', 'A'):
+                            self.auto_continue_enabled = not self.auto_continue_enabled
+                else:
+                    time.sleep(self.delay)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            if old_settings:
+                try:
+                    import termios
+                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+                except Exception:
+                    pass
+            # 恢复正常屏幕缓冲并显示光标
+            sys.stdout.write("\033[?1049l\033[?25h")
+            sys.stdout.flush()
+
 
 def cmd_top(args):
     """启动类似 top/htop 的实时监控控制台"""
@@ -1458,15 +1543,24 @@ def cmd_top(args):
     prompt = getattr(args, "continue_prompt", "继续")
     dashboard = CodexTopDashboard(delay=delay, continue_prompt=prompt)
 
-    if batch or not sys.stdout.isatty():
+    # 1. 显式指定批处理快照模式
+    if batch:
         dashboard.render_batch()
-    else:
+        return
+
+    # 2. 交互式持久实时刷新 (类似 top / htop)
+    if curses is not None and sys.stdout.isatty():
         try:
             curses.wrapper(dashboard.run_curses)
+            return
         except KeyboardInterrupt:
-            pass
+            return
         except Exception:
-            dashboard.render_batch()
+            # curses 遭遇异常（如终端环境不支持），平滑回退到 ANSI 持续实时循环，绝不单次退出！
+            pass
+
+    # 3. ANSI 持久实时刷新循环（保底确保一直动态刷新，按 q 退出）
+    dashboard.run_ansi_loop()
 
 
 def main():
