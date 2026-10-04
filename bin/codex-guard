@@ -23,6 +23,8 @@ import sqlite3
 import subprocess
 import argparse
 import threading
+import shutil
+import shlex
 try:
     import curses
 except ImportError:
@@ -163,26 +165,38 @@ class CodexSocketClient:
                 masked = bytearray(data[i] ^ mask[i % 4] for i in range(length))
                 s.sendall(hdr + masked)
 
+            def recv_exact(n: int) -> Optional[bytes]:
+                b = bytearray()
+                while len(b) < n:
+                    chunk = s.recv(n - len(b))
+                    if not chunk:
+                        return None
+                    b.extend(chunk)
+                return bytes(b)
+
             def recv_frame():
-                header = s.recv(2)
-                if len(header) < 2:
+                header = recv_exact(2)
+                if not header or len(header) < 2:
                     return None, None
                 b1, b2 = header[0], header[1]
                 opcode = b1 & 0x0F
                 is_masked = (b2 & 0x80) != 0
                 length = b2 & 0x7F
                 if length == 126:
-                    length = struct.unpack("!H", s.recv(2))[0]
+                    ext = recv_exact(2)
+                    if not ext or len(ext) < 2:
+                        return None, None
+                    length = struct.unpack("!H", ext)[0]
                 elif length == 127:
-                    length = struct.unpack("!Q", s.recv(8))[0]
+                    ext = recv_exact(8)
+                    if not ext or len(ext) < 8:
+                        return None, None
+                    length = struct.unpack("!Q", ext)[0]
 
-                mask = s.recv(4) if is_masked else None
-                buf = bytearray()
-                while len(buf) < length:
-                    chunk = s.recv(min(4096, length - len(buf)))
-                    if not chunk:
-                        break
-                    buf.extend(chunk)
+                mask = recv_exact(4) if is_masked else None
+                buf = recv_exact(length)
+                if buf is None:
+                    return None, None
                 if is_masked and mask:
                     buf = bytearray(buf[i] ^ mask[i % 4] for i in range(len(buf)))
                 return opcode, bytes(buf)
@@ -326,12 +340,26 @@ class SessionManager:
         return []
 
     @classmethod
-    def get_thread_info(cls, thread_id: str) -> Optional[Dict[str, Any]]:
-        """获取指定会话的完整元数据"""
+    def get_db_connection(cls) -> Optional[sqlite3.Connection]:
+        """安全建立只读模式 SQLite 连接 (超时 10s，避免与 app-server 写操作互锁)"""
         if not os.path.exists(cls.DB_PATH):
             return None
         try:
-            conn = sqlite3.connect(cls.DB_PATH)
+            real_path = os.path.realpath(cls.DB_PATH)
+            return sqlite3.connect(f"file:{real_path}?mode=ro", uri=True, timeout=10.0)
+        except Exception:
+            try:
+                return sqlite3.connect(cls.DB_PATH, timeout=10.0)
+            except Exception:
+                return None
+
+    @classmethod
+    def get_thread_info(cls, thread_id: str) -> Optional[Dict[str, Any]]:
+        """获取指定会话的完整元数据"""
+        conn = cls.get_db_connection()
+        if not conn:
+            return None
+        try:
             c = conn.cursor()
             c.execute(
                 "SELECT id, title, cwd, updated_at, source, model FROM threads WHERE id = ?",
@@ -349,7 +377,10 @@ class SessionManager:
                     "model": row[5]
                 }
         except Exception:
-            pass
+            try:
+                conn.close()
+            except Exception:
+                pass
         return None
 
     @classmethod
@@ -373,10 +404,10 @@ class SessionManager:
     @classmethod
     def get_recent_sessions(cls, limit: int = 15) -> List[Dict[str, Any]]:
         """从 SQLite 获取最近的会话列表"""
-        if not os.path.exists(cls.DB_PATH):
+        conn = cls.get_db_connection()
+        if not conn:
             return []
         try:
-            conn = sqlite3.connect(cls.DB_PATH)
             c = conn.cursor()
             c.execute(
                 """SELECT id, title, cwd, updated_at, source, model, archived
@@ -401,17 +432,11 @@ class SessionManager:
                 })
             return res
         except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
             return []
-
-    @classmethod
-    def save_snapshot(cls, active_pids: List[int], reason: str = "quota_low") -> Dict[str, Any]:
-        """暂停前保存活跃会话与列表快照"""
-        loaded_ids = cls.get_loaded_thread_ids()
-        sessions = []
-        for tid in loaded_ids:
-            info = cls.get_thread_info(tid)
-            if info:
-                sessions.append(info)
 
     @classmethod
     def interrupt_active_turns(cls) -> List[Dict[str, Any]]:
@@ -453,6 +478,17 @@ class SessionManager:
     @classmethod
     def kill_orphaned_tool_subprocesses(cls):
         """检查并清理 Codex 衍生出来的子工具进程（例如正在运行的脚本或编译任务）"""
+        def get_descendants(parent_pid: int) -> List[int]:
+            try:
+                res = subprocess.run(["pgrep", "-P", str(parent_pid)], capture_output=True, text=True, timeout=1)
+                children = [int(p) for p in res.stdout.strip().split() if p]
+                desc = list(children)
+                for c in children:
+                    desc.extend(get_descendants(c))
+                return desc
+            except Exception:
+                return []
+
         for pid_dir in glob.glob("/proc/[0-9]*"):
             try:
                 pid = int(os.path.basename(pid_dir))
@@ -462,9 +498,9 @@ class SessionManager:
                 with open(cmdline_path, "rb") as f:
                     content = f.read().decode("utf-8", errors="ignore")
                 if "code-mode-host" in content:
-                    res = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True, timeout=1)
-                    child_pids = [int(p) for p in res.stdout.strip().split() if p]
-                    for cpid in child_pids:
+                    descendants = get_descendants(pid)
+                    # 从底层叶子节点向上清理
+                    for cpid in reversed(descendants):
                         try:
                             with open(f"/proc/{cpid}/cmdline", "rb") as f:
                                 c_cmd = f.read().decode("utf-8", errors="ignore")
@@ -561,23 +597,38 @@ class SessionManager:
             uid = os.getuid()
             env["XDG_RUNTIME_DIR"] = f"/run/user/{uid}"
 
-        codex_bin = "/home/lizhonghu/.local/bin/codex"
+        codex_bin = shutil.which("codex") or os.path.expanduser("~/.local/bin/codex")
+        safe_bin = shlex.quote(codex_bin)
+        safe_sid = shlex.quote(session_id)
+        safe_prompt = shlex.quote(prompt)
+        bash_cmd = f"{safe_bin} resume {safe_sid} {safe_prompt}; exec bash"
+
         # 1. 尝试在 GNOME 终端中打开独立交互窗口拉起
         try:
             cmd = [
                 "gnome-terminal",
                 f"--title=Codex - 自动恢复任务 [{session_id[:8]}]",
                 "--",
-                "bash", "-c", f"{codex_bin} resume {session_id} '{prompt}'; exec bash"
+                "bash", "-c", bash_cmd
             ]
             res = subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
             if res.returncode == 0:
                 log(f"🚀 [自动拉起] 已在 GNOME 终端中自动拉起 Codex 会话 [{session_id[:8]}...]！")
                 return True
         except Exception as e:
-            log(f"gnome-terminal 拉起失败: {e}，尝试使用 screen 启动...")
+            log(f"gnome-terminal 拉起失败: {e}，尝试其他终端...")
 
-        # 2. 回退到 screen 后台会话拉起
+        # 2. 尝试 x-terminal-emulator
+        try:
+            xterm_cmd = ["x-terminal-emulator", "-T", f"Codex - 自动恢复任务 [{session_id[:8]}]", "-e", f"bash -c {shlex.quote(bash_cmd)}"]
+            res = subprocess.run(xterm_cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            if res.returncode == 0:
+                log(f"🚀 [自动拉起] 已在 x-terminal-emulator 中自动拉起 Codex 会话 [{session_id[:8]}...]！")
+                return True
+        except Exception:
+            pass
+
+        # 3. 回退到 screen 后台会话拉起
         try:
             screen_cmd = ["screen", "-dmS", f"codex-{session_id[:8]}", codex_bin, "resume", session_id, prompt]
             res = subprocess.run(screen_cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
@@ -587,10 +638,19 @@ class SessionManager:
         except Exception as e:
             log(f"screen 拉起失败: {e}")
 
+        # 4. 终极保底: nohup 后台启动
+        try:
+            nohup_cmd = ["nohup", codex_bin, "resume", session_id, prompt]
+            subprocess.Popen(nohup_cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            log(f"🚀 [自动拉起] 已在 nohup 后台进程中自动拉起 Codex 会话 [{session_id[:8]}...]！")
+            return True
+        except Exception as e:
+            log(f"nohup 拉起失败: {e}")
+
         return False
 
     @classmethod
-    def restore_and_verify_sessions(cls, resumed_pids: List[int], send_continue: bool = True, continue_prompt: str = "继续") -> Dict[str, Any]:
+    def restore_and_verify_sessions(cls, resumed_pids: List[int], send_continue: bool = True, continue_prompt: str = "继续", exclude_thread_ids: Optional[List[str]] = None) -> Dict[str, Any]:
         """额度恢复时：唤醒进程、验证会话状态、确保会话列表完整原状，并自动发送「继续」指令"""
         cls.clean_stale_locks()
 
@@ -620,6 +680,7 @@ class SessionManager:
         for tid in loaded_now:
             target_thread_ids.add(tid)
 
+        exclude_set = set(exclude_thread_ids or [])
         restored_details = []
         for tid in target_thread_ids:
             info = cls.get_thread_info(tid)
@@ -629,7 +690,11 @@ class SessionManager:
 
             queued = False
             if send_continue:
-                queued = cls.send_continue_prompt(tid, continue_prompt)
+                if tid in exclude_set:
+                    log(f"会话 [{title}] (ID: {tid[:8]}...) 已作为新终端会话启动，跳过重复队列注入。")
+                    queued = True
+                else:
+                    queued = cls.send_continue_prompt(tid, continue_prompt)
 
             restored_details.append({
                 "id": tid,
@@ -706,7 +771,7 @@ class ProcessManager:
                     target = os.path.realpath(fd_link)
                     if target.startswith("/dev/pts/") or target.startswith("/dev/tty"):
                         with open(target, "wb", buffering=0) as f:
-                            f.write(b"\033[?1000l\033[?1002l\033[?1003l\033[?1006l")
+                            f.write(b"\033[?1000l\033[?1001l\033[?1002l\033[?1003l\033[?1004l\033[?1005l\033[?1006l\033[?1015l")
                         return
                 except Exception:
                     pass
@@ -1007,17 +1072,49 @@ def run_watch_loop(
                     running_clients = [p for p, st, _ in client_pids if st != "T"]
 
                     # 若当前没有运行中的客户端，说明此前被关闭/杀掉，主动执行“自动拉起”！
+                    launched_sid = None
                     if not running_clients and not resumed_pids:
+                        target_sid = None
+                        # 1. 尝试从快照 sessions 检索
                         saved_sessions = snapshot_data.get("sessions", [])
-                        target_sid = saved_sessions[0]["id"] if saved_sessions and saved_sessions[0].get("id") else None
+                        for s in saved_sessions:
+                            if s.get("id"):
+                                target_sid = s["id"]
+                                break
+                        # 2. 尝试从快照 interrupted_turns 检索
+                        if not target_sid:
+                            for it in snapshot_data.get("interrupted_turns", []):
+                                if it.get("threadId"):
+                                    target_sid = it["threadId"]
+                                    break
+                        # 3. 尝试从快照 loaded_thread_ids 检索
+                        if not target_sid:
+                            lids = snapshot_data.get("loaded_thread_ids", [])
+                            if lids:
+                                target_sid = lids[0]
+                        # 4. 尝试从 app-server 当前活跃线程检索
+                        if not target_sid:
+                            curr_loaded = SessionManager.get_loaded_thread_ids()
+                            if curr_loaded:
+                                target_sid = curr_loaded[0]
+                        # 5. 尝试从本地 SQLite 最近历史检索
+                        if not target_sid:
+                            recent = SessionManager.get_recent_sessions(limit=1)
+                            if recent and recent[0].get("id"):
+                                target_sid = recent[0]["id"]
+
                         if target_sid:
                             log(f"检测到当前无存活客户端，正在自动拉起 Codex 会话 [{target_sid[:8]}...]...")
-                            SessionManager.launch_codex_session(target_sid, prompt=continue_prompt)
+                            if SessionManager.launch_codex_session(target_sid, prompt=continue_prompt):
+                                launched_sid = target_sid
                             time.sleep(2)
 
                     # 恢复会话列表、校验并自动发送“继续”
                     SessionManager.restore_and_verify_sessions(
-                        resumed_pids, send_continue=True, continue_prompt=continue_prompt
+                        resumed_pids,
+                        send_continue=True,
+                        continue_prompt=continue_prompt,
+                        exclude_thread_ids=[launched_sid] if launched_sid else []
                     )
 
                     # 将快照标记为已恢复，避免重复拉起
@@ -1042,6 +1139,12 @@ def run_watch_loop(
                     running_clients = [p for p, st, _ in client_pids if st != "T"]
                     if running_clients:
                         loaded_threads = SessionManager.get_loaded_thread_ids()
+                        # 清理已卸载会话的空闲计时器
+                        curr_loaded_set = set(loaded_threads)
+                        for tid in list(idle_since.keys()):
+                            if tid not in curr_loaded_set:
+                                idle_since.pop(tid, None)
+
                         now = time.time()
                         for tid in loaded_threads:
                             live = SessionManager.get_live_thread_state(tid)
@@ -1298,6 +1401,11 @@ class CodexTopDashboard:
         snap = QuotaSnapshot(rate_data) if rate_data else None
 
         client_pids = ProcessManager.get_codex_client_pids()
+        current_pids = {p for p, _, _ in client_pids}
+        dead_pids = [p for p in self.cpu_tracker if p not in current_pids]
+        for p in dead_pids:
+            self.cpu_tracker.pop(p, None)
+
         proc_metrics = []
         for p, st, cmd in client_pids:
             m = self.get_proc_metrics(p)
@@ -1459,6 +1567,12 @@ class CodexTopDashboard:
         """极速纯内存重绘 Curses 界面 (耗时 < 0.2ms，拖拽窗口极致丝滑)"""
         snap = data["snapshot"]
 
+        def c_pair(n: int) -> int:
+            try:
+                return curses.color_pair(n)
+            except Exception:
+                return 0
+
         def safe_addstr(y, x, s, attr=0):
             if y < 0 or y >= maxy or x < 0 or x >= maxx:
                 return
@@ -1485,17 +1599,17 @@ class CodexTopDashboard:
 
         # 极小窗口自适应
         if maxy < 6 or maxx < 35:
-            safe_addstr(0, 0, " codex-top ", curses.color_pair(6) | curses.A_BOLD)
+            safe_addstr(0, 0, " codex-top ", c_pair(6) | curses.A_BOLD)
             if snap:
                 safe_addstr(1, 0, f"5h: {snap.used_percent:.0f}% used | {snap.remaining_percent:.0f}% left")
             safe_addstr(2, 0, f"PIDs: {len(data['processes'])} [q:退出]")
             return
 
         # 1. 顶部 Header
-        st_color = curses.color_pair(1) if data["service_active"] else curses.color_pair(2)
+        st_color = c_pair(1) if data["service_active"] else c_pair(2)
         st_desc = f"ACTIVE (PID {data['service_pid']})" if data["service_active"] else "INACTIVE"
         pad_line(0, 0, f" codex-top  - {data['time_str']} {data['uptime']}, load: {data['load']}, Sentinel: {st_desc}")
-        safe_addstr(0, 0, " codex-top ", curses.color_pair(6) | curses.A_BOLD)
+        safe_addstr(0, 0, " codex-top ", c_pair(6) | curses.A_BOLD)
         sentinel_pos = len(f" codex-top  - {data['time_str']} {data['uptime']}, load: {data['load']}, Sentinel: ")
         safe_addstr(0, sentinel_pos, st_desc, st_color | curses.A_BOLD)
 
@@ -1507,7 +1621,7 @@ class CodexTopDashboard:
                 return "█"*u, "░"*(width - u)
 
             rem = snap.remaining_percent
-            q_attr = curses.color_pair(3) if rem <= 3.0 else (curses.color_pair(2) if rem <= 15.0 else curses.color_pair(1))
+            q_attr = c_pair(3) if rem <= 3.0 else (c_pair(2) if rem <= 15.0 else c_pair(1))
             u_chars, r_chars = make_bar_txt(snap.used_percent, bar_w)
 
             pad_line(1, 0, f"5h Quota:   [{' '*bar_w}] {snap.used_percent:.1f}% used | {rem:.1f}% left (Reset: {snap.reset_datetime_str} in {snap.time_to_reset_str})")
@@ -1519,7 +1633,7 @@ class CodexTopDashboard:
                 w_rem = max(0.0, 100.0 - w_used)
                 wu_chars, wr_chars = make_bar_txt(w_used, bar_w)
                 pad_line(2, 0, f"Week Quota: [{' '*bar_w}] {w_used:.1f}% used | {w_rem:.1f}% left | Credits: {snap.credit_balance} (SAFE - 0 used)")
-                safe_addstr(2, 13, wu_chars, curses.color_pair(4) | curses.A_BOLD)
+                safe_addstr(2, 13, wu_chars, c_pair(4) | curses.A_BOLD)
                 safe_addstr(2, 13 + len(wu_chars), wr_chars, curses.A_DIM)
 
             auto_str = "ON (5s debounce)" if self.auto_continue_enabled else "OFF"
@@ -1529,7 +1643,7 @@ class CodexTopDashboard:
         pad_line(4, 0, "")
         header_row = 5
         header_txt = f" {'PID':<8} {'STATE':<9} {'CPU%':<6} {'MEM':<7} {'TURNS':<6} {'STATUS':<12} {'ACTIVE SESSION / TASK TITLE':<{max(10, maxx-52)}}"
-        pad_line(header_row, 0, header_txt, curses.color_pair(7) | curses.A_BOLD)
+        pad_line(header_row, 0, header_txt, c_pair(7) | curses.A_BOLD)
 
         cur_row = 6
         if not data["processes"]:
@@ -1539,7 +1653,7 @@ class CodexTopDashboard:
             for p in data["processes"]:
                 if cur_row >= maxy - 9:
                     break
-                st_attr = curses.color_pair(3) | curses.A_BOLD if p["state"] == "T" else curses.color_pair(1) | curses.A_BOLD
+                st_attr = c_pair(3) | curses.A_BOLD if p["state"] == "T" else c_pair(1) | curses.A_BOLD
                 th_title = p["cmd"][:45]
                 turns_cnt = "-"
                 turn_st = "-"
@@ -1586,7 +1700,7 @@ class CodexTopDashboard:
                     if itype == "commandExecution":
                         c_st = it.get("status", "running")
                         cmd_txt = it.get("command", "").replace("\n", " ").strip()
-                        c_color = curses.color_pair(1) if c_st == "completed" else (curses.color_pair(3) if c_st == "failed" else curses.color_pair(2))
+                        c_color = c_pair(1) if c_st == "completed" else (c_pair(3) if c_st == "failed" else c_pair(2))
                         dur = f"{it.get('durationMs', 0)}ms" if it.get("durationMs") else ""
                         safe_addstr(cur_row, 2, "• [CMD:", curses.A_BOLD)
                         safe_addstr(cur_row, 8, c_st, c_color | curses.A_BOLD)
@@ -1594,10 +1708,10 @@ class CodexTopDashboard:
                         if dur:
                             safe_addstr(cur_row, min(maxx - len(dur) - 2, 8 + len(c_st) + len(cmd_txt) + 3), dur, curses.A_DIM)
                     elif itype == "reasoning":
-                        safe_addstr(cur_row, 2, "• [REASONING] ", curses.color_pair(4) | curses.A_BOLD)
+                        safe_addstr(cur_row, 2, "• [REASONING] ", c_pair(4) | curses.A_BOLD)
                         safe_addstr(cur_row, 16, f"Deep model reasoning & kernel latency analysis... ({t0['title'][:25]})", curses.A_DIM)
                     elif itype == "webSearch":
-                        safe_addstr(cur_row, 2, "• [SEARCH] ", curses.color_pair(2) | curses.A_BOLD)
+                        safe_addstr(cur_row, 2, "• [SEARCH] ", c_pair(2) | curses.A_BOLD)
                         safe_addstr(cur_row, 13, it.get("query", "")[:max(10, maxx-16)])
                     elif itype == "message":
                         content = str(it.get("content", "")).replace("\n", " ")[:max(10, maxx-16)]
@@ -1617,7 +1731,7 @@ class CodexTopDashboard:
 
         now = time.time()
         if self.flash_message and (now - self.flash_time < 3.0):
-            pad_line(footer_y, 0, f" >>> {self.flash_message}", curses.color_pair(1) | curses.A_BOLD)
+            pad_line(footer_y, 0, f" >>> {self.flash_message}", c_pair(1) | curses.A_BOLD)
         else:
             pad_line(footer_y, 0, f" [q] 退出  [r] 刷新  [p] 暂停  [c] 唤醒  [Space] 注入「{self.continue_prompt}」  [+/-] 调频 ({self.delay:.1f}s)")
 
@@ -1635,7 +1749,7 @@ class CodexTopDashboard:
             pass
 
         # 显式向终端注销任何鼠标追踪协议（防止终端把鼠标移动当作键盘按键发送）
-        sys.stdout.write("\033[?1000l\033[?1002l\033[?1003l\033[?1006l")
+        sys.stdout.write("\033[?1000l\033[?1001l\033[?1002l\033[?1003l\033[?1004l\033[?1005l\033[?1006l\033[?1015l")
         sys.stdout.flush()
 
         try:
@@ -1702,6 +1816,16 @@ class CodexTopDashboard:
                         SessionManager.save_snapshot(active, reason="manual_top_pause", interrupted_turns=interrupted)
                         for pid in active:
                             ProcessManager.suspend_pid(pid)
+                        # 立即乐观更新内存缓存，达成 0ms 视觉即时响应
+                        with self._data_lock:
+                            if self._cached_data and "processes" in self._cached_data:
+                                for p in self._cached_data["processes"]:
+                                    if p["pid"] in active:
+                                        p["state"] = "T"
+                                        p["state_desc"] = "STOPPED"
+                                if interrupted and self._cached_data.get("threads"):
+                                    for t in self._cached_data["threads"]:
+                                        t["last_turn_status"] = "interrupted"
                         self.set_flash(f"已暂停！掐断 {len(interrupted)} 个推理任务，挂起 {len(active)} 个客户端。")
                     else:
                         self.set_flash("没有处于运行中的 Codex 进程或推理任务需要暂停。")
@@ -1713,6 +1837,13 @@ class CodexTopDashboard:
                     if stopped:
                         for pid in stopped:
                             ProcessManager.resume_pid(pid)
+                        # 立即乐观更新内存缓存，达成 0ms 视觉即时响应
+                        with self._data_lock:
+                            if self._cached_data and "processes" in self._cached_data:
+                                for p in self._cached_data["processes"]:
+                                    if p["pid"] in stopped:
+                                        p["state"] = "S"
+                                        p["state_desc"] = "RUNNING"
                         SessionManager.restore_and_verify_sessions(stopped, send_continue=True, continue_prompt=self.continue_prompt)
                         self.set_flash(f"已唤醒 {len(stopped)} 个 Codex 进程并发送「{self.continue_prompt}」！")
                     else:
@@ -1760,7 +1891,7 @@ class CodexTopDashboard:
             self._force_refresh_event.set()
             if self._worker_thread:
                 self._worker_thread.join(timeout=0.5)
-            sys.stdout.write("\033[?1000l\033[?1002l\033[?1003l\033[?1006l")
+            sys.stdout.write("\033[?1000l\033[?1001l\033[?1002l\033[?1003l\033[?1004l\033[?1005l\033[?1006l\033[?1015l")
             sys.stdout.flush()
 
     def run_ansi_loop(self):
@@ -1769,7 +1900,7 @@ class CodexTopDashboard:
         self._worker_thread = threading.Thread(target=self._background_collector, daemon=True)
         self._worker_thread.start()
 
-        sys.stdout.write("\033[?25l\033[?1049h\033[?1000l\033[?1002l\033[?1003l\033[?1006l")  # 隐藏光标，关闭鼠标追踪
+        sys.stdout.write("\033[?25l\033[?1049h\033[?1000l\033[?1001l\033[?1002l\033[?1003l\033[?1004l\033[?1005l\033[?1006l\033[?1015l")  # 隐藏光标，关闭鼠标追踪
         sys.stdout.flush()
         old_settings = None
         resized = [False]
@@ -1823,6 +1954,15 @@ class CodexTopDashboard:
                                 SessionManager.save_snapshot(active, reason="manual_top_pause", interrupted_turns=interrupted)
                                 for pid in active:
                                     ProcessManager.suspend_pid(pid)
+                                with self._data_lock:
+                                    if self._cached_data and "processes" in self._cached_data:
+                                        for p in self._cached_data["processes"]:
+                                            if p["pid"] in active:
+                                                p["state"] = "T"
+                                                p["state_desc"] = "STOPPED"
+                                        if interrupted and self._cached_data.get("threads"):
+                                            for t in self._cached_data["threads"]:
+                                                t["last_turn_status"] = "interrupted"
                                 self.set_flash(f"已暂停！掐断 {len(interrupted)} 个推理任务，挂起 {len(active)} 个客户端。")
                             else:
                                 self.set_flash("没有处于运行中的 Codex 进程或推理任务需要暂停。")
@@ -1833,6 +1973,12 @@ class CodexTopDashboard:
                             stopped = [p for p, st, _ in pids if st == "T"]
                             for pid in stopped:
                                 ProcessManager.resume_pid(pid)
+                            with self._data_lock:
+                                if self._cached_data and "processes" in self._cached_data:
+                                    for p in self._cached_data["processes"]:
+                                        if p["pid"] in stopped:
+                                            p["state"] = "S"
+                                            p["state_desc"] = "RUNNING"
                             SessionManager.restore_and_verify_sessions(stopped, send_continue=True, continue_prompt=self.continue_prompt)
                             self.set_flash(f"已唤醒 {len(stopped)} 个 Codex 进程并发送「{self.continue_prompt}」！")
                             self.trigger_background_refresh()
@@ -1884,7 +2030,7 @@ class CodexTopDashboard:
                     termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
                 except Exception:
                     pass
-            sys.stdout.write("\033[?1049l\033[?25h\033[?1000l\033[?1002l\033[?1003l\033[?1006l")
+            sys.stdout.write("\033[?1049l\033[?25h\033[?1000l\033[?1001l\033[?1002l\033[?1003l\033[?1004l\033[?1005l\033[?1006l\033[?1015l")
             sys.stdout.flush()
 
 
