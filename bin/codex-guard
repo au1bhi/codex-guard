@@ -1068,6 +1068,66 @@ def cmd_pause(args):
     send_notification("Codex 已手动暂停", f"已掐断 {cnt_turns} 个运行中任务，挂起 {cnt_pids} 个客户端，Token 消耗已彻底停止。")
 
 
+def cmd_stop(args):
+    """彻底停止正在运行的 Codex 任务与客户端，掐断模型推理，防止继续消耗额度或自动拉起"""
+    # 1. 彻底掐断当前所有正在运行的回合（向 Codex App-Server 发送 turn/interrupt，立即终止 Token 推理）
+    interrupted = SessionManager.interrupt_active_turns()
+    
+    # 2. 终止孤儿工具/子进程
+    SessionManager.kill_orphaned_tool_subprocesses()
+
+    # 3. 终止所有运行中或挂起中的 Codex 客户端进程
+    pids_info = ProcessManager.get_codex_client_pids()
+    target_pids = [p for p, _, _ in pids_info]
+    
+    # 若进程处于挂起状态 (SIGSTOP)，先发 SIGCONT 再发 SIGTERM 保证能接收退出信号
+    for pid in target_pids:
+        try:
+            os.kill(pid, signal.SIGCONT)
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            log(f"终止进程 {pid} 异常: {e}")
+
+    # 等待 0.8 秒检查是否有进程未退出，若仍存活则 SIGKILL 强杀
+    if target_pids:
+        time.sleep(0.8)
+        for pid in target_pids:
+            if os.path.exists(f"/proc/{pid}"):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except Exception:
+                    pass
+
+    # 4. 更新快照状态为 manual_stopped，确保后台守护不会误以为是额度耗尽而自动再次拉起！
+    if os.path.exists(SNAPSHOT_FILE):
+        try:
+            with open(SNAPSHOT_FILE, "r", encoding="utf-8") as f:
+                snap_data = json.load(f)
+            snap_data["reason"] = "manual_stopped"
+            snap_data["stopped_at"] = time.time()
+            with open(SNAPSHOT_FILE, "w", encoding="utf-8") as f:
+                json.dump(snap_data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    # 5. 可选：停止后台守护服务 (--all 或 --service)
+    stop_service = getattr(args, "all", False) or getattr(args, "service", False)
+    if stop_service:
+        subprocess.run(["systemctl", "--user", "stop", SERVICE_NAME], check=False)
+        print(f"\033[32m[成功] 已停止后台守护服务: {SERVICE_NAME}\033[0m")
+
+    cnt_turns = len(interrupted)
+    cnt_pids = len(target_pids)
+    print(f"\033[32m[成功] 已彻底停止 Codex 运行！\033[0m")
+    print(f"  • 已向 App-Server 发送中断，掐断了 {cnt_turns} 个正在运行的推理回合（Token 消耗已彻底终止）")
+    print(f"  • 已终止 {cnt_pids} 个 Codex 交互客户端进程及衍生工具子进程")
+    if not stop_service:
+        print(f"  • 提示：后台守护服务仍保持待机（如需彻底退出后台守护，请运行 `codex-guard stop --all` 或 `codex-guard service stop`）")
+    send_notification("Codex 已彻底停止", f"已掐断 {cnt_turns} 个推理任务，终止 {cnt_pids} 个客户端，额度消耗彻底终止。")
+
+
 def cmd_resume(args):
     """手动恢复所有被暂停的 Codex 客户端进程或恢复指定 session"""
     if args.session_id:
@@ -1439,6 +1499,18 @@ WantedBy=default.target
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
         print(f"\033[32m[成功] 已卸载后台服务: {SERVICE_NAME}\033[0m")
 
+    elif action == "stop":
+        subprocess.run(["systemctl", "--user", "stop", SERVICE_NAME], check=False)
+        print(f"\033[32m[成功] 已停止后台守护服务: {SERVICE_NAME}\033[0m")
+
+    elif action == "start":
+        subprocess.run(["systemctl", "--user", "start", SERVICE_NAME], check=False)
+        print(f"\033[32m[成功] 已启动后台守护服务: {SERVICE_NAME}\033[0m")
+
+    elif action == "restart":
+        subprocess.run(["systemctl", "--user", "restart", SERVICE_NAME], check=False)
+        print(f"\033[32m[成功] 已重启后台守护服务: {SERVICE_NAME}\033[0m")
+
     elif action == "status":
         subprocess.run(["systemctl", "--user", "status", SERVICE_NAME])
 
@@ -1719,7 +1791,7 @@ class CodexTopDashboard:
         if self.flash_message and (now - self.flash_time < 3.0):
             out.write(f" {BOLD}{GREEN}>>> {self.flash_message}{RESET}\n")
         else:
-            out.write(f" {BOLD}[q]{RESET} 退出  {BOLD}[r]{RESET} 刷新  {BOLD}[p]{RESET} 暂停  {BOLD}[c]{RESET} 唤醒  {BOLD}[Space]{RESET} 注入「继续」  {BOLD}[+/-]{RESET} 调频 ({self.delay:.1f}s)\n")
+            out.write(f" {BOLD}[q]{RESET} 退出  {BOLD}[r]{RESET} 刷新  {BOLD}[p]{RESET} 暂停  {BOLD}[c]{RESET} 唤醒  {BOLD}[k]{RESET} 停止  {BOLD}[Space]{RESET} 注入「继续」  {BOLD}[+/-]{RESET} 调频 ({self.delay:.1f}s)\n")
         out.flush()
 
     def render_batch(self, out=sys.stdout):
@@ -1913,7 +1985,7 @@ class CodexTopDashboard:
         if self.flash_message and (now - self.flash_time < 3.0):
             pad_line(footer_y, 0, f" >>> {self.flash_message}", c_pair(1) | curses.A_BOLD)
         else:
-            pad_line(footer_y, 0, f" [q] 退出  [r] 刷新  [p] 暂停  [c] 唤醒  [Space] 注入「{self.continue_prompt}」  [+/-] 调频 ({self.delay:.1f}s)")
+            pad_line(footer_y, 0, f" [q] 退出  [r] 刷新  [p] 暂停  [c] 唤醒  [k] 彻底停止  [Space] 注入「{self.continue_prompt}」  [+/-] 调频 ({self.delay:.1f}s)")
 
     def run_curses(self, stdscr):
         """交互式实时全屏 Curses TUI 运行循环 (高帧率事件响应，拖拽窗口毫秒级跟手)"""
@@ -2010,6 +2082,46 @@ class CodexTopDashboard:
                         self.set_flash(f"已暂停！掐断 {len(interrupted)} 个推理任务，挂起 {len(active)} 个客户端。")
                     else:
                         self.set_flash("没有处于运行中的 Codex 进程或推理任务需要暂停。")
+                    self.trigger_background_refresh()
+                    needs_redraw = True
+                elif ch in (ord('k'), ord('K')):
+                    interrupted = SessionManager.interrupt_active_turns()
+                    SessionManager.kill_orphaned_tool_subprocesses()
+                    pids_info = ProcessManager.get_codex_client_pids()
+                    target_pids = [p for p, _, _ in pids_info]
+                    for pid in target_pids:
+                        try:
+                            os.kill(pid, signal.SIGCONT)
+                            os.kill(pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                        except Exception:
+                            pass
+                    if target_pids:
+                        time.sleep(0.3)
+                        for pid in target_pids:
+                            if os.path.exists(f"/proc/{pid}"):
+                                try:
+                                    os.kill(pid, signal.SIGKILL)
+                                except Exception:
+                                    pass
+                    if os.path.exists(SNAPSHOT_FILE):
+                        try:
+                            with open(SNAPSHOT_FILE, "r", encoding="utf-8") as f:
+                                snap_data = json.load(f)
+                            snap_data["reason"] = "manual_stopped"
+                            snap_data["stopped_at"] = time.time()
+                            with open(SNAPSHOT_FILE, "w", encoding="utf-8") as f:
+                                json.dump(snap_data, f, ensure_ascii=False, indent=2)
+                        except Exception:
+                            pass
+                    with self._data_lock:
+                        if self._cached_data:
+                            self._cached_data["processes"] = []
+                            if self._cached_data.get("threads"):
+                                for t in self._cached_data["threads"]:
+                                    t["last_turn_status"] = "interrupted"
+                    self.set_flash(f"已彻底停止！掐断 {len(interrupted)} 个推理任务，终止 {len(target_pids)} 个客户端进程。")
                     self.trigger_background_refresh()
                     needs_redraw = True
                 elif ch in (ord('c'), ord('C')):
@@ -2150,6 +2262,46 @@ class CodexTopDashboard:
                                 self.set_flash("没有处于运行中的 Codex 进程或推理任务需要暂停。")
                             self.trigger_background_refresh()
                             last_refresh = 0.0
+                        elif ch in ('k', 'K'):
+                            interrupted = SessionManager.interrupt_active_turns()
+                            SessionManager.kill_orphaned_tool_subprocesses()
+                            pids_info = ProcessManager.get_codex_client_pids()
+                            target_pids = [p for p, _, _ in pids_info]
+                            for pid in target_pids:
+                                try:
+                                    os.kill(pid, signal.SIGCONT)
+                                    os.kill(pid, signal.SIGTERM)
+                                except ProcessLookupError:
+                                    pass
+                                except Exception:
+                                    pass
+                            if target_pids:
+                                time.sleep(0.3)
+                                for pid in target_pids:
+                                    if os.path.exists(f"/proc/{pid}"):
+                                        try:
+                                            os.kill(pid, signal.SIGKILL)
+                                        except Exception:
+                                            pass
+                            if os.path.exists(SNAPSHOT_FILE):
+                                try:
+                                    with open(SNAPSHOT_FILE, "r", encoding="utf-8") as f:
+                                        snap_data = json.load(f)
+                                    snap_data["reason"] = "manual_stopped"
+                                    snap_data["stopped_at"] = time.time()
+                                    with open(SNAPSHOT_FILE, "w", encoding="utf-8") as f:
+                                        json.dump(snap_data, f, ensure_ascii=False, indent=2)
+                                except Exception:
+                                    pass
+                            with self._data_lock:
+                                if self._cached_data:
+                                    self._cached_data["processes"] = []
+                                    if self._cached_data.get("threads"):
+                                        for t in self._cached_data["threads"]:
+                                            t["last_turn_status"] = "interrupted"
+                            self.set_flash(f"已彻底停止！掐断 {len(interrupted)} 个推理任务，终止 {len(target_pids)} 个客户端进程。")
+                            self.trigger_background_refresh()
+                            last_refresh = 0.0
                         elif ch in ('c', 'C'):
                             pids = ProcessManager.get_codex_client_pids()
                             stopped = [p for p, st, _ in pids if st == "T"]
@@ -2274,6 +2426,12 @@ def main():
     # pause
     subparsers.add_parser("pause", help="手动暂停正在运行的 Codex 客户端进程并记录快照")
 
+    # stop / kill
+    for s_name in ("stop", "kill"):
+        p_stop = subparsers.add_parser(s_name, help="彻底停止正在运行的 Codex 客户端与推理任务，掐断 Token 消耗并防止自动拉起")
+        p_stop.add_argument("--all", action="store_true", help="同时停止后台守护服务 codex-quota-guard.service")
+        p_stop.add_argument("--service", action="store_true", help="同时停止后台守护服务 codex-quota-guard.service")
+
     # resume
     p_resume = subparsers.add_parser("resume", help="手动唤醒被暂停的 Codex 客户端进程或恢复指定 session")
     p_resume.add_argument("session_id", nargs="?", default=None, help="可选：指定恢复的 Session ID")
@@ -2287,8 +2445,8 @@ def main():
     p_run.add_argument("--continue-prompt", type=str, default="继续", help="恢复时发送的指令 (默认: '继续')")
 
     # service
-    p_service = subparsers.add_parser("service", help="管理 systemd 守护服务 (install / uninstall / status)")
-    p_service.add_argument("action", choices=["install", "uninstall", "status"], help="操作")
+    p_service = subparsers.add_parser("service", help="管理 systemd 守护服务 (install / uninstall / start / stop / restart / status)")
+    p_service.add_argument("action", choices=["install", "uninstall", "start", "stop", "restart", "status"], help="操作")
     p_service.add_argument("--threshold", type=float, default=3.0, help="额度剩余百分比阈值 (默认: 3.0)")
     p_service.add_argument("--interval", type=int, default=10, help="监控轮询间隔秒数 (默认: 10)")
     p_service.add_argument("--continue-prompt", type=str, default="继续", help="恢复或空闲时向会话自动发送的指令 (默认: '继续')")
@@ -2306,7 +2464,7 @@ def main():
         cmd_status(None)
         return
 
-    known_cmds = ["top", "status", "sessions", "watch", "pause", "resume", "run", "service", "-h", "--help"]
+    known_cmds = ["top", "status", "sessions", "watch", "pause", "stop", "kill", "resume", "run", "service", "-h", "--help"]
     if sys.argv[1] not in known_cmds:
         args, unknown = parser.parse_known_args(["run"] + sys.argv[1:])
         cmd_run(args, unknown)
@@ -2324,6 +2482,8 @@ def main():
         cmd_watch(args)
     elif args.subcommand == "pause":
         cmd_pause(args)
+    elif args.subcommand in ("stop", "kill"):
+        cmd_stop(args)
     elif args.subcommand == "resume":
         cmd_resume(args)
     elif args.subcommand == "run":

@@ -526,5 +526,63 @@ class TestPerformanceAndStress(unittest.TestCase):
         self.assertLessEqual(len(dash.cpu_tracker), 10, f"cpu_tracker has {len(dash.cpu_tracker)} entries, expected <= 10")
 
 
+class TestCmdStop(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.snap_file = os.path.join(self.temp_dir.name, "snapshot_test.json")
+        self.orig_snap = cg.SNAPSHOT_FILE
+        cg.SNAPSHOT_FILE = self.snap_file
+
+    def tearDown(self):
+        cg.SNAPSHOT_FILE = self.orig_snap
+        self.temp_dir.cleanup()
+
+    def test_cmd_stop_execution(self):
+        with open(self.snap_file, "w") as f:
+            json.dump({"pids": [1234], "reason": "low_quota"}, f)
+
+        mock_args = MagicMock()
+        mock_args.all = False
+        mock_args.service = False
+
+        with patch.object(cg.SessionManager, "interrupt_active_turns", return_value=[{"thread_id": "th1", "turn_id": "turn1"}]) as mock_interrupt, \
+             patch.object(cg.SessionManager, "kill_orphaned_tool_subprocesses") as mock_orphans, \
+             patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[(54321, "S", "codex")]), \
+             patch("os.kill") as mock_kill, \
+             patch("time.sleep"), \
+             patch("os.path.exists", side_effect=lambda path: path == self.snap_file), \
+             patch.object(cg, "send_notification") as mock_notify:
+
+            cg.cmd_stop(mock_args)
+
+            mock_interrupt.assert_called_once()
+            mock_orphans.assert_called_once()
+            killed_calls = mock_kill.call_args_list
+            # Verify SIGCONT then SIGTERM sent to 54321
+            self.assertEqual(killed_calls[0][0], (54321, cg.signal.SIGCONT))
+            self.assertEqual(killed_calls[1][0], (54321, cg.signal.SIGTERM))
+
+            # Verify snapshot updated to manual_stopped
+            with open(self.snap_file, "r") as f:
+                snap_data = json.load(f)
+            self.assertEqual(snap_data.get("reason"), "manual_stopped")
+            self.assertIn("stopped_at", snap_data)
+
+    def test_cmd_stop_with_service_flag(self):
+        mock_args = MagicMock()
+        mock_args.all = True
+        mock_args.service = False
+
+        with patch.object(cg.SessionManager, "interrupt_active_turns", return_value=[]), \
+             patch.object(cg.SessionManager, "kill_orphaned_tool_subprocesses"), \
+             patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[]), \
+             patch("subprocess.run") as mock_run, \
+             patch.object(cg, "send_notification"):
+
+            cg.cmd_stop(mock_args)
+            mock_run.assert_called_with(["systemctl", "--user", "stop", cg.SERVICE_NAME], check=False)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
