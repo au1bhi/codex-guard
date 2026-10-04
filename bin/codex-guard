@@ -413,6 +413,80 @@ class SessionManager:
             if info:
                 sessions.append(info)
 
+    @classmethod
+    def interrupt_active_turns(cls) -> List[Dict[str, Any]]:
+        """主动掐断所有正在运行中的 Turn（向 Codex App-Server 发送 turn/interrupt），
+        立即中止云端模型推理、Token 消耗及工具执行，彻底杜绝额度偷跑！
+        返回被中断的 turn 列表: [{'threadId': tid, 'turnId': turn_id, 'title': ...}]
+        """
+        interrupted = []
+        loaded_ids = cls.get_loaded_thread_ids()
+        for tid in loaded_ids:
+            try:
+                res = CodexSocketClient.query_app_server("thread/read", {"threadId": tid, "includeTurns": True})
+                if not res or not isinstance(res, dict):
+                    continue
+                thread = res.get("thread", {})
+                status = thread.get("status", {})
+                status_type = status.get("type") if isinstance(status, dict) else str(status)
+                turns = thread.get("turns", [])
+                if turns:
+                    last_turn = turns[-1]
+                    turn_st = last_turn.get("status")
+                    turn_id = last_turn.get("id")
+                    if turn_st == "inProgress" or status_type not in ("idle", "notLoaded", None):
+                        if turn_id:
+                            CodexSocketClient.query_app_server("turn/interrupt", {"threadId": tid, "turnId": turn_id})
+                            tinfo = cls.get_thread_info(tid)
+                            title = tinfo.get("title", tid[:8]) if tinfo else tid[:8]
+                            log(f"🛑 [额度拦截] 已掐断会话 [{title}] (Turn #{len(turns)}) 的后台运行: 已向 App-Server 发送 turn/interrupt！OpenAI Token 消耗已彻底终止。")
+                            interrupted.append({
+                                "threadId": tid,
+                                "turnId": turn_id,
+                                "title": title,
+                                "turns_count": len(turns)
+                            })
+            except Exception as e:
+                log(f"掐断会话 [{tid[:8]}] 异常: {e}")
+        return interrupted
+
+    @classmethod
+    def kill_orphaned_tool_subprocesses(cls):
+        """检查并清理 Codex 衍生出来的子工具进程（例如正在运行的脚本或编译任务）"""
+        for pid_dir in glob.glob("/proc/[0-9]*"):
+            try:
+                pid = int(os.path.basename(pid_dir))
+                cmdline_path = os.path.join(pid_dir, "cmdline")
+                if not os.path.exists(cmdline_path):
+                    continue
+                with open(cmdline_path, "rb") as f:
+                    content = f.read().decode("utf-8", errors="ignore")
+                if "code-mode-host" in content:
+                    res = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True, timeout=1)
+                    child_pids = [int(p) for p in res.stdout.strip().split() if p]
+                    for cpid in child_pids:
+                        try:
+                            with open(f"/proc/{cpid}/cmdline", "rb") as f:
+                                c_cmd = f.read().decode("utf-8", errors="ignore")
+                            if "code-mode" in c_cmd:
+                                continue
+                            os.kill(cpid, signal.SIGTERM)
+                            log(f"已终止 Codex 遗留子工具进程 PID: {cpid}")
+                        except Exception:
+                            pass
+            except Exception:
+                continue
+
+    @classmethod
+    def save_snapshot(cls, active_pids: List[int], reason: str = "quota_low", interrupted_turns: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        """暂停前保存活跃会话与列表快照"""
+        loaded_ids = cls.get_loaded_thread_ids()
+        sessions = []
+        for tid in loaded_ids:
+            info = cls.get_thread_info(tid)
+            if info:
+                sessions.append(info)
+
         snapshot = {
             "timestamp": time.time(),
             "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -420,12 +494,13 @@ class SessionManager:
             "active_pids": active_pids,
             "loaded_thread_ids": loaded_ids,
             "sessions": sessions,
+            "interrupted_turns": interrupted_turns or [],
         }
 
         try:
             with open(SNAPSHOT_FILE, "w", encoding="utf-8") as f:
                 json.dump(snapshot, f, ensure_ascii=False, indent=2)
-            log(f"已保存会话快照: {len(sessions)} 个活跃会话 (PIDs: {active_pids})")
+            log(f"已保存会话快照: {len(sessions)} 个活跃会话 (PIDs: {active_pids}), 中断了 {len(interrupted_turns or [])} 个正在运行的回合")
         except Exception as e:
             log(f"保存会话快照失败: {e}")
 
@@ -489,12 +564,16 @@ class SessionManager:
                 pass
 
         saved_sessions = snapshot.get("sessions", [])
+        interrupted_turns = snapshot.get("interrupted_turns", [])
         loaded_now = cls.get_loaded_thread_ids()
 
         target_thread_ids = set()
         for sess in saved_sessions:
             if sess.get("id"):
                 target_thread_ids.add(sess["id"])
+        for iturn in interrupted_turns:
+            if iturn.get("threadId"):
+                target_thread_ids.add(iturn["threadId"])
         for tid in loaded_now:
             target_thread_ids.add(tid)
 
@@ -741,20 +820,26 @@ def cmd_sessions(args):
 
 
 def cmd_pause(args):
-    """手动暂停所有运行中的 Codex 客户端进程"""
+    """手动暂停所有运行中的 Codex 客户端进程与后台推理任务"""
+    # 1. 首先主动掐断 App-Server 正在生成的 turn (彻底停止 Token 消耗)
+    interrupted = SessionManager.interrupt_active_turns()
+    SessionManager.kill_orphaned_tool_subprocesses()
+
+    # 2. 暂停所有前端 CLI 进程
     pids = ProcessManager.get_codex_client_pids()
     active_pids = [p for p, st, _ in pids if st != "T"]
-    if not active_pids:
-        print("没有处于运行中的 Codex 客户端进程需要暂停。")
-        return
 
-    # 保存会话快照
-    SessionManager.save_snapshot(active_pids, reason="manual_pause")
+    # 3. 保存快照
+    SessionManager.save_snapshot(active_pids, reason="manual_pause", interrupted_turns=interrupted)
 
     for pid in active_pids:
         if ProcessManager.suspend_pid(pid):
             print(f"已发送 SIGSTOP 暂停 PID: {pid}")
-    send_notification("Codex 已手动暂停", f"已暂停 {len(active_pids)} 个 Codex 进程，会话状态与列表已记录。")
+
+    cnt_turns = len(interrupted)
+    cnt_pids = len(active_pids)
+    print(f"已成功暂停: {cnt_turns} 个后台运行中任务已掐断 (Token 停止消耗)，{cnt_pids} 个客户端已挂起。")
+    send_notification("Codex 已手动暂停", f"已掐断 {cnt_turns} 个运行中任务，挂起 {cnt_pids} 个客户端，Token 消耗已彻底停止。")
 
 
 def cmd_resume(args):
@@ -810,6 +895,12 @@ def run_watch_loop(
 
             # 情况 1: 额度低于阈值 -> 必须停止/暂停
             if rem <= threshold:
+                # 1. 核心防御：首先掐断正在后台运行的 Turn（直接向 App-Server 发送 turn/interrupt，立即掐断 OpenAI API 推理与 Token 消耗！）
+                interrupted = SessionManager.interrupt_active_turns()
+                if interrupted:
+                    SessionManager.kill_orphaned_tool_subprocesses()
+
+                # 2. 挂起所有运行中的前端 CLI 客户端
                 client_pids = ProcessManager.get_codex_client_pids()
                 newly_suspended = []
 
@@ -818,11 +909,11 @@ def run_watch_loop(
                         if ProcessManager.suspend_pid(pid):
                             suspended_pids.add(pid)
                             newly_suspended.append(pid)
-                            log(f"⚠️ [额度预警] 5h额度仅剩 {rem:.1f}% (<= {threshold}%)！已暂停 Codex (PID {pid}: {cmd})")
+                            log(f"⚠️ [额度预警] 5h额度仅剩 {rem:.1f}% (<= {threshold}%)！已暂停 Codex 客户端 (PID {pid}: {cmd})")
 
-                if newly_suspended:
+                if newly_suspended or interrupted:
                     # 快照记录会话元数据与列表
-                    SessionManager.save_snapshot(list(suspended_pids), reason="quota_exceeded")
+                    SessionManager.save_snapshot(list(suspended_pids), reason="quota_exceeded", interrupted_turns=interrupted)
                     loaded_threads = SessionManager.get_loaded_thread_ids()
                     session_desc = ""
                     if loaded_threads:
@@ -831,9 +922,9 @@ def run_watch_loop(
                             session_desc = f"\n当前任务: {tinfo['title']}"
 
                     send_notification(
-                        "⚠️ Codex 额度不足，已自动暂停",
+                        "⚠️ Codex 额度不足，已自动拦截暂停",
                         f"当前 5h 额度仅剩 {rem:.1f}%（低于 {threshold}% 保护线）！\n"
-                        f"已保护性暂停 {len(newly_suspended)} 个任务以防扣除额外 Credits。{session_desc}\n"
+                        f"已掐断 {len(interrupted)} 个正在运行的模型推理任务，挂起 {len(newly_suspended)} 个客户端，杜绝消耗额外 Credits。{session_desc}\n"
                         f"将在 {snap.reset_datetime_str} 额度刷新后自动唤醒并发送「{continue_prompt}」继续执行。",
                         urgency="critical",
                     )
@@ -962,11 +1053,13 @@ def cmd_run(args, unknown_args):
             if data:
                 snap = QuotaSnapshot(data)
                 if snap.remaining_percent <= args.threshold:
-                    log(f"⚠️ [Guard Run] 5h额度仅剩 {snap.remaining_percent:.1f}%！正在暂停子进程 PID {proc.pid}...")
-                    SessionManager.save_snapshot([proc.pid], reason="quota_exceeded")
+                    log(f"⚠️ [Guard Run] 5h额度仅剩 {snap.remaining_percent:.1f}%！正在掐断推理并暂停子进程 PID {proc.pid}...")
+                    interrupted = SessionManager.interrupt_active_turns()
+                    SessionManager.kill_orphaned_tool_subprocesses()
+                    SessionManager.save_snapshot([proc.pid], reason="quota_exceeded", interrupted_turns=interrupted)
                     send_notification(
                         "⚠️ Codex 任务已暂停",
-                        f"额度低于 {args.threshold}%，已暂停当前任务。将在刷新后自动发送「{args.continue_prompt}」继续执行。",
+                        f"额度低于 {args.threshold}%，已掐断后台推理并暂停任务。将在刷新后自动发送「{args.continue_prompt}」继续执行。",
                     )
                     ProcessManager.suspend_pid(proc.pid)
 
@@ -1526,15 +1619,17 @@ class CodexTopDashboard:
                     self.trigger_background_refresh()
                     needs_redraw = True
                 elif ch in (ord('p'), ord('P')):
+                    interrupted = SessionManager.interrupt_active_turns()
+                    SessionManager.kill_orphaned_tool_subprocesses()
                     pids = ProcessManager.get_codex_client_pids()
                     active = [p for p, st, _ in pids if st != "T"]
-                    if active:
-                        SessionManager.save_snapshot(active, reason="manual_top_pause")
+                    if active or interrupted:
+                        SessionManager.save_snapshot(active, reason="manual_top_pause", interrupted_turns=interrupted)
                         for pid in active:
                             ProcessManager.suspend_pid(pid)
-                        self.set_flash(f"已发送 SIGSTOP 暂停 {len(active)} 个 Codex 进程！")
+                        self.set_flash(f"已暂停！掐断 {len(interrupted)} 个推理任务，挂起 {len(active)} 个客户端。")
                     else:
-                        self.set_flash("没有处于运行中的 Codex 进程需要暂停。")
+                        self.set_flash("没有处于运行中的 Codex 进程或推理任务需要暂停。")
                     self.trigger_background_refresh()
                     needs_redraw = True
                 elif ch in (ord('c'), ord('C')):
@@ -1645,11 +1740,17 @@ class CodexTopDashboard:
                             self.trigger_background_refresh()
                             last_refresh = 0.0
                         elif ch in ('p', 'P'):
+                            interrupted = SessionManager.interrupt_active_turns()
+                            SessionManager.kill_orphaned_tool_subprocesses()
                             pids = ProcessManager.get_codex_client_pids()
                             active = [p for p, st, _ in pids if st != "T"]
-                            for pid in active:
-                                ProcessManager.suspend_pid(pid)
-                            self.set_flash(f"已发送 SIGSTOP 暂停 {len(active)} 个 Codex 进程！")
+                            if active or interrupted:
+                                SessionManager.save_snapshot(active, reason="manual_top_pause", interrupted_turns=interrupted)
+                                for pid in active:
+                                    ProcessManager.suspend_pid(pid)
+                                self.set_flash(f"已暂停！掐断 {len(interrupted)} 个推理任务，挂起 {len(active)} 个客户端。")
+                            else:
+                                self.set_flash("没有处于运行中的 Codex 进程或推理任务需要暂停。")
                             self.trigger_background_refresh()
                             last_refresh = 0.0
                         elif ch in ('c', 'C'):
