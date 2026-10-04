@@ -4,10 +4,11 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/codex-guard watch --threshold 3.0 --interval 10 --continue-prompt "继续" --idle-delay 5
-Restart=always
+ExecStart="%h/.local/lib/codex-guard/codex-guard" watch --threshold 3.0 --interval 10 --continue-prompt "继续" --idle-delay 5
+Restart=on-failure
 RestartSec=10
-Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+PassEnvironment=CODEX_HOME DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR
 Environment=DISPLAY=:0
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
 
