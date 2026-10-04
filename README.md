@@ -81,12 +81,14 @@ Guard Rule: Threshold <= 3.0% (SIGSTOP) | Auto-Continue: ON (5s debounce) | Plan
   • [CMD:running]   python3 tools/analyze.py normal-h127 auto
 
 ───────────────────────────────────────────────────────────────────────────────
- [q] 退出  [r] 刷新  [p] 暂停  [c] 唤醒  [Space] 注入「继续」  [+/-] 调频 (1.0s)
+ [q] 退出  [r] 刷新  [p] 暂停  [c] 唤醒  [k] 停止  [Space] 注入「继续」  [+/-] 调频 (1.0s)
 ```
 - **交互按键**：
+  - `[q]` / `[ESC]` / `Ctrl+C`：安全退出 `codex-top` 控制台（不会影响后台 Codex 任务）。
   - `[Space]`（空格键）：立即向当前活跃任务注入「继续」指令，催促 Codex 推进！
-  - `[p]`：一键内核级挂起（`SIGSTOP`）正在运行的 Codex。
+  - `[p]`：一键内核级挂起（`SIGSTOP`）正在运行的 Codex 进程。
   - `[c]`：一键唤醒（`SIGCONT`）并自动继续执行。
+  - `[k]`：彻底终止（Kill/Interrupt）当前运行中的任务与客户端进程（掐断模型推理，杜绝消耗额度，防止守护服务误拉起）。
   - `[+]` / `[-]`：实时调整刷新频率（0.2s ~ 10s）。
   - `[b]` / `-b` 参数：单次快照批处理输出（如 `codex-top -b`）。
 
@@ -126,17 +128,26 @@ codex-guard status
 codex-guard sessions --limit 10
 ```
 
-### 3. 手动暂停 / 恢复
+### 3. 手动暂停 / 恢复 / 彻底停止
 如需手动强制控制正在运行的任务：
 ```bash
-codex-guard pause   # 暂停所有运行中的 Codex 客户端进程并记录快照
-codex-guard resume  # 唤醒所有被暂停的 Codex 客户端进程，并自动发送「继续」
+codex-guard pause        # 临时挂起 (SIGSTOP) 所有运行中的 Codex 进程
+codex-guard resume       # 唤醒 (SIGCONT) 所有被暂停的 Codex 进程并发送「继续」
+codex-guard stop         # 彻底停止：掐断 App-Server 模型推理 + 终止客户端进程（立即停止计费）
+codex-guard stop --all   # 一键全关：彻底停止任务 + 停止后台守护服务 codex-quota-guard
 ```
 
 ### 4. 守护服务管理
 ```bash
-# 查看后台守护服务日志与运行状态
+# 查看后台守护服务运行状态与日志
+codex-guard service status
+# 或
 systemctl --user status codex-quota-guard
+
+# 停止 / 启动 / 重启守护服务
+codex-guard service stop
+codex-guard service start
+codex-guard service restart
 
 # 查看详细守护时间线日志
 tail -f ~/.codex/quota_guard.log
