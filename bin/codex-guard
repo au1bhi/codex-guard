@@ -559,8 +559,10 @@ class ProcessManager:
                 if "codex" not in exe.lower() and not any("codex" in p.lower() for p in parts[:2]):
                     continue
 
-                # 排除内部守护进程和服务
-                if any(x in cmd_full for x in ["app-server", "daemon", "code-mode-host", "quota-guard", "codex-guard"]):
+                # 排除内部守护进程、服务以及监控控制台
+                if any(x in cmd_full for x in ["app-server", "daemon", "code-mode-host", "quota-guard", "codex-guard", "codex-top", "codex-quota"]):
+                    continue
+                if any(p in ("top", "watch", "status", "restore", "pause", "resume") for p in parts):
                     continue
 
                 # 读取状态
@@ -575,8 +577,24 @@ class ProcessManager:
         return results
 
     @staticmethod
+    def _disable_tty_mouse(pid: int):
+        """向目标进程关联的伪终端发送转义指令，禁用鼠标追踪上报，防止进程暂停后鼠标移动乱码"""
+        for fd_num in (0, 1, 2):
+            fd_link = f"/proc/{pid}/fd/{fd_num}"
+            if os.path.exists(fd_link):
+                try:
+                    target = os.path.realpath(fd_link)
+                    if target.startswith("/dev/pts/") or target.startswith("/dev/tty"):
+                        with open(target, "wb", buffering=0) as f:
+                            f.write(b"\033[?1000l\033[?1002l\033[?1003l\033[?1006l")
+                        return
+                except Exception:
+                    pass
+
+    @staticmethod
     def suspend_pid(pid: int) -> bool:
         try:
+            ProcessManager._disable_tty_mouse(pid)
             os.kill(pid, signal.SIGSTOP)
             return True
         except ProcessLookupError:
@@ -1448,6 +1466,10 @@ class CodexTopDashboard:
         except Exception:
             pass
 
+        # 显式向终端注销任何鼠标追踪协议（防止终端把鼠标移动当作键盘按键发送）
+        sys.stdout.write("\033[?1000l\033[?1002l\033[?1003l\033[?1006l")
+        sys.stdout.flush()
+
         try:
             curses.use_default_colors()
             bg_color = -1
@@ -1568,6 +1590,8 @@ class CodexTopDashboard:
             self._force_refresh_event.set()
             if self._worker_thread:
                 self._worker_thread.join(timeout=0.5)
+            sys.stdout.write("\033[?1000l\033[?1002l\033[?1003l\033[?1006l")
+            sys.stdout.flush()
 
     def run_ansi_loop(self):
         """ANSI 转义终端持久实时全屏循环 (在 Curses 不可用或无特殊支持时的万能实时保底)"""
@@ -1575,7 +1599,7 @@ class CodexTopDashboard:
         self._worker_thread = threading.Thread(target=self._background_collector, daemon=True)
         self._worker_thread.start()
 
-        sys.stdout.write("\033[?25l\033[?1049h")  # 隐藏光标，切换到备用屏幕缓冲
+        sys.stdout.write("\033[?25l\033[?1049h\033[?1000l\033[?1002l\033[?1003l\033[?1006l")  # 隐藏光标，关闭鼠标追踪
         sys.stdout.flush()
         old_settings = None
         resized = [False]
@@ -1684,7 +1708,7 @@ class CodexTopDashboard:
                     termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
                 except Exception:
                     pass
-            sys.stdout.write("\033[?1049l\033[?25h")
+            sys.stdout.write("\033[?1049l\033[?25h\033[?1000l\033[?1002l\033[?1003l\033[?1006l")
             sys.stdout.flush()
 
 
