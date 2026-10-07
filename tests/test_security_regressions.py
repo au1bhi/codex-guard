@@ -307,7 +307,7 @@ class WebSocketTests(IsolatedTest):
         data = exact(length)
         return b1 & 15, bytes(v ^ mask[i % 4] for i, v in enumerate(data))
 
-    def query(self, mode="success"):
+    def query(self, mode="success", rpc_result=None, invoke=None):
         path = str(Path(self.tmp.name) / "rpc.sock")
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.addCleanup(server.close)
@@ -349,7 +349,7 @@ class WebSocketTests(IsolatedTest):
                     elif mode == "timeout":
                         time.sleep(0.25)
                     else:
-                        payload = json.dumps({"id": 2, "result": {"ok": True}}).encode()
+                        payload = json.dumps({"id": 2, "result": rpc_result if rpc_result is not None else {"ok": True}}).encode()
                         conn.sendall(self.frame(payload[:10], final=False) + self.frame(b"ping", opcode=9) + self.frame(payload[10:], opcode=0))
                         opcode, pong = self.read_client(conn)
                         observed.append({"pong": pong.decode(), "opcode": opcode})
@@ -361,7 +361,7 @@ class WebSocketTests(IsolatedTest):
         worker.start()
         with patch.object(cg.CodexSocketClient, "ensure_daemon_running", return_value=True), \
              patch.object(cg.CodexSocketClient, "get_socket_path", return_value=path):
-            result = cg.CodexSocketClient.query_app_server("test/read", timeout=0.1 if mode == "timeout" else 1)
+            result = invoke() if invoke else cg.CodexSocketClient.query_app_server("test/read", timeout=0.1 if mode == "timeout" else 1)
         worker.join(timeout=3)
         self.assertFalse(worker.is_alive())
         self.assertFalse(errors, errors)
@@ -373,6 +373,19 @@ class WebSocketTests(IsolatedTest):
         self.assertEqual(observed[1], {"method": "initialized"})
         self.assertEqual(observed[2]["method"], "test/read")
         self.assertEqual(observed[3], {"pong": "ping", "opcode": 10})
+
+    def test_dashboard_continue_starts_turn_over_real_unix_websocket(self):
+        with patch.object(cg.CodexSocketClient, "query_rate_limits", return_value=healthy()), \
+             patch.object(cg.SessionManager, "get_loaded_thread_ids", return_value=["thread"]), \
+             patch.object(cg.SessionManager, "is_subagent", return_value=False), \
+             patch.object(cg.SessionManager, "get_thread_info", return_value={"title": "Task"}), \
+             patch.object(cg.SessionManager, "get_live_thread_state", return_value={
+                 "status_type": "idle", "last_turn_id": "old", "last_turn_status": "completed"}):
+            result, observed = self.query(rpc_result={"turn": {"id": "new", "status": "inProgress"}},
+                                          invoke=cg.CodexTopDashboard().continue_now)
+        self.assertIn("1 个空闲任务", result)
+        self.assertEqual(observed[2], {"id": 2, "method": "turn/start", "params": {
+            "threadId": "thread", "input": [{"type": "text", "text": "继续"}]}})
 
     def test_http_rejection(self):
         self.assertIsNone(self.query("bad_handshake")[0])
@@ -620,6 +633,82 @@ dash.run_ansi_loop()
 
 
 class DashboardControlTests(IsolatedTest):
+    @staticmethod
+    def idle_task():
+        return {"status_type": "idle", "last_turn_id": "previous", "last_turn_status": "completed"}
+
+    def test_space_starts_all_idle_tasks_skipping_blank_busy_and_subagent(self):
+        dashboard = cg.CodexTopDashboard()
+        states = {"blank": {"status_type": "idle"}, "busy": {"status_type": "active"},
+                  "first": self.idle_task(), "second": self.idle_task()}
+        def rpc(method, params):
+            self.assertEqual(method, "turn/start")
+            self.assertEqual(params["input"], [{"type": "text", "text": "继续"}])
+            return {"turn": {"id": "new-" + params["threadId"], "status": "inProgress"}}
+        with patch.object(cg.CodexSocketClient, "query_rate_limits", return_value=healthy()), \
+             patch.object(cg.SessionManager, "get_loaded_thread_ids", return_value=["blank", "busy", "sub", "first", "second", "first"]), \
+             patch.object(cg.SessionManager, "is_subagent", side_effect=lambda tid: tid == "sub"), \
+             patch.object(cg.SessionManager, "get_live_thread_state", side_effect=lambda tid: states[tid]), \
+             patch.object(cg.SessionManager, "get_thread_info", return_value={}), \
+             patch.object(cg.CodexSocketClient, "query_app_server", side_effect=rpc) as server, \
+             patch.object(cg.SessionManager, "send_continue_prompt") as queue:
+            self.assertTrue(dashboard.handle_control_key(ord(' ')))
+            dashboard._action_thread.join(timeout=2)
+        self.assertEqual([call.args[1]["threadId"] for call in server.call_args_list], ["first", "second"])
+        self.assertIn("2 个空闲任务", dashboard.flash_message)
+        queue.assert_not_called()
+
+    def test_space_failure_does_not_prevent_next_idle_task(self):
+        dashboard = cg.CodexTopDashboard()
+        with patch.object(cg.CodexSocketClient, "query_rate_limits", return_value=healthy()), \
+             patch.object(cg.SessionManager, "get_loaded_thread_ids", return_value=["first", "second"]), \
+             patch.object(cg.SessionManager, "is_subagent", return_value=False), \
+             patch.object(cg.SessionManager, "get_live_thread_state", return_value=self.idle_task()), \
+             patch.object(cg.SessionManager, "get_thread_info", return_value={}), \
+             patch.object(cg.SessionManager, "start_idle_continue", side_effect=[RuntimeError("rejected"), "turn"]) as start:
+            message = dashboard.continue_now()
+        self.assertEqual(start.call_count, 2)
+        self.assertIn("1 个空闲任务", message)
+        self.assertIn("first", message)
+        self.assertIn("rejected", message)
+
+    def test_space_does_not_send_when_quota_is_low_or_unknown(self):
+        for quota in [None, healthy(97), healthy(20, weekly=98)]:
+            with self.subTest(quota=quota), \
+                 patch.object(cg.CodexSocketClient, "query_rate_limits", return_value=quota), \
+                 patch.object(cg.SessionManager, "start_idle_continue") as start:
+                with self.assertRaisesRegex(RuntimeError, "额度"):
+                    cg.CodexTopDashboard().continue_now()
+                start.assert_not_called()
+
+    def test_space_reports_when_only_blank_tasks_exist(self):
+        with patch.object(cg.CodexSocketClient, "query_rate_limits", return_value=healthy()), \
+             patch.object(cg.SessionManager, "get_loaded_thread_ids", return_value=["blank"]), \
+             patch.object(cg.SessionManager, "is_subagent", return_value=False), \
+             patch.object(cg.SessionManager, "get_live_thread_state", return_value={"status_type": "idle"}), \
+             patch.object(cg.SessionManager, "start_idle_continue") as start:
+            with self.assertRaisesRegex(RuntimeError, "空白"):
+                cg.CodexTopDashboard().continue_now()
+            start.assert_not_called()
+
+    def test_manual_continue_rechecks_idle_state_before_start(self):
+        with patch.object(cg.SessionManager, "is_subagent", return_value=False), \
+             patch.object(cg.SessionManager, "get_live_thread_state", return_value={"status_type": "active"}), \
+             patch.object(cg.CodexSocketClient, "query_app_server") as server:
+            with self.assertRaisesRegex(RuntimeError, "忙碌"):
+                cg.SessionManager.start_idle_continue("thread")
+            server.assert_not_called()
+
+    def test_manual_continue_requires_confirmed_turn_without_retry(self):
+        for reply in [None, {}, {"turn": {}}, {"turn": {"id": "turn", "status": "failed"}}]:
+            with self.subTest(reply=reply), \
+                 patch.object(cg.SessionManager, "is_subagent", return_value=False), \
+                 patch.object(cg.SessionManager, "get_live_thread_state", return_value=self.idle_task()), \
+                 patch.object(cg.CodexSocketClient, "query_app_server", return_value=reply) as server:
+                with self.assertRaisesRegex(RuntimeError, "未确认"):
+                    cg.SessionManager.start_idle_continue("thread")
+                self.assertEqual(server.call_count, 1)
+
     def test_auto_continue_setting_is_private_persistent_and_toggleable(self):
         dashboard = cg.CodexTopDashboard()
         status = {"service_active": True, "service_state": "active", "service_pid": "42", "default_auto_continue": True}

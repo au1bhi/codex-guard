@@ -798,6 +798,28 @@ class SessionManager:
         return
 
     @classmethod
+    def start_idle_continue(cls, thread_id: str, prompt: str = "继续") -> str:
+        """Start a turn on an existing idle task and require server acknowledgement."""
+        if not isinstance(thread_id, str) or not thread_id or cls.is_subagent(thread_id):
+            raise RuntimeError("目标不是可续跑的根会话。")
+        # Read again immediately before starting; a cached idle state can be stale.
+        live = cls.get_live_thread_state(thread_id)
+        if (live.get("status_type") != "idle" or not live.get("last_turn_id")
+                or live.get("last_turn_status") not in {"completed", "interrupted", "failed"}):
+            raise RuntimeError("会话已忙碌、状态不可用或尚无任务历史。")
+        result = CodexSocketClient.query_app_server("turn/start", {
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": prompt}],
+        })
+        turn = result.get("turn") if isinstance(result, dict) else None
+        if (not isinstance(turn, dict) or not isinstance(turn.get("id"), str)
+                or not turn["id"] or turn.get("status") not in {"inProgress", "completed"}):
+            log(f"手动继续 [{thread_id[:8]}] 未获回合启动确认。")
+            raise RuntimeError("后台未确认回合启动，请检查会话后再操作。")
+        log(f"手动继续 [{thread_id[:8]}] 已启动回合 [{turn['id']}]。")
+        return turn["id"]
+
+    @classmethod
     def send_continue_prompt(cls, thread_id: str, prompt: str = "继续") -> bool:
         """使用 codex queue 向指定会话发送消息（例如 '继续'）触发自动继续工作"""
         if not isinstance(thread_id, str) or not thread_id or thread_id.startswith("-"):
@@ -1857,12 +1879,31 @@ class CodexTopDashboard:
         snap = QuotaSnapshot(CodexSocketClient.query_rate_limits())
         if not snap.valid or snap.protection_remaining <= 3:
             raise RuntimeError("额度不足或不可用，暂不发送继续。")
-        for tid in SessionManager.get_loaded_thread_ids():
-            if not SessionManager.is_subagent(tid) and SessionManager.get_live_thread_state(tid).get("status_type") == "idle":
-                if SessionManager.send_continue_prompt(tid, self.continue_prompt):
-                    return "已向当前空闲会话发送继续。"
-                raise RuntimeError("发送失败，请查看守护日志。")
-        raise RuntimeError("没有可接收继续的空闲根会话。")
+        started, failed = [], []
+        for tid in dict.fromkeys(SessionManager.get_loaded_thread_ids()):
+            if SessionManager.is_subagent(tid):
+                continue
+            live = SessionManager.get_live_thread_state(tid)
+            if (live.get("status_type") != "idle" or not live.get("last_turn_id")
+                    or live.get("last_turn_status") not in {"completed", "interrupted", "failed"}):
+                continue
+            info = SessionManager.get_thread_info(tid) or {}
+            label = f"{info.get('title') or tid[:8]} [{tid[:8]}]"
+            try:
+                SessionManager.start_idle_continue(tid, self.continue_prompt)
+                started.append(label)
+            except RuntimeError as error:
+                failed.append(f"{label}: {error}")
+        if not started and not failed:
+            raise RuntimeError("没有可续跑的空闲任务（空白、忙碌和子代理会话已跳过）。")
+        message = f"已向 {len(started)} 个空闲任务发送继续并启动回合。"
+        if len(started) == 1:
+            message += f" {started[0]}"
+        if failed:
+            message += f" {len(failed)} 个未确认: " + "; ".join(failed)
+        if not started:
+            raise RuntimeError(message)
+        return message
 
     def handle_control_key(self, key):
         actions = {ord('g'): self.toggle_guard, ord('s'): self.toggle_guard,
@@ -2153,7 +2194,7 @@ class CodexTopDashboard:
 
         out.write(f"\n{DIM}───────────────────────────────────────────────────────────────────────────────{RESET}\n")
         now = time.time()
-        if self.flash_message and (now - self.flash_time < 3.0):
+        if self.flash_message and (now - self.flash_time < 8.0):
             out.write(f" {BOLD}{GREEN}>>> {self.flash_message}{RESET}\n")
         else:
             out.write(f" [q] 退出  [r] 刷新  [+/-] 调频 ({self.delay:.1f}s) | [g] 守护开关 [a] 自动继续 [p/c] 暂停/唤醒 [Space] 继续\n")
@@ -2350,7 +2391,7 @@ class CodexTopDashboard:
         pad_line(sep_y, 0, "─" * (maxx - 1), curses.A_DIM)
 
         now = time.time()
-        if self.flash_message and (now - self.flash_time < 3.0):
+        if self.flash_message and (now - self.flash_time < 8.0):
             pad_line(footer_y, 0, f" >>> {self.flash_message}", c_pair(1) | curses.A_BOLD)
         else:
             pad_line(maxy - 1, 0, f" [q] 退出 [r] 刷新 [+/-] 调频 ({self.delay:.1f}s) [g] 守护 [a] 自动继续 [p/c] 暂停/唤醒 [Space] 继续")
