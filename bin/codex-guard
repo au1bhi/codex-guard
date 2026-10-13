@@ -635,22 +635,65 @@ class SessionManager:
             thread_id = parent
         return thread_id
 
+    @staticmethod
+    def is_capacity_error(turn: Any) -> bool:
+        """检查回合是否因模型容量受限 (Selected model is at capacity) 失败"""
+        if not isinstance(turn, dict):
+            return False
+        error = turn.get("error")
+        if error:
+            text_parts = []
+            if isinstance(error, dict):
+                for val in error.values():
+                    if isinstance(val, str):
+                        text_parts.append(val.lower())
+            elif isinstance(error, str):
+                text_parts.append(error.lower())
+            combined = " ".join(text_parts)
+            if ("at capacity" in combined or "serveroverloaded" in combined or
+                    "server_overloaded" in combined or "try a different model" in combined):
+                return True
+
+        items = turn.get("items") or []
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict):
+                    content = str(item.get("text") or item.get("message") or item.get("content") or "").lower()
+                    if "at capacity" in content or "try a different model" in content:
+                        return True
+        return False
+
     @classmethod
     def get_live_thread_state(cls, thread_id: str) -> Dict[str, Any]:
         """获取指定会话的实时运行状态（status, turns 等）"""
         res = CodexSocketClient.query_app_server("thread/read", {"threadId": thread_id, "includeTurns": True})
-        if not res or not isinstance(res, dict):
-            return {}
-        thread = res.get("thread", {})
+        thread = {}
+        if isinstance(res, dict):
+            thread = res.get("thread", {})
         status = thread.get("status", {})
         status_type = status.get("type") if isinstance(status, dict) else str(status)
         turns = thread.get("turns", [])
-        last_turn = turns[-1] if turns else {}
+        if not turns:
+            turns_res = CodexSocketClient.query_app_server("thread/turns/list", {"threadId": thread_id}, timeout=4.0)
+            if isinstance(turns_res, dict) and isinstance(turns_res.get("data"), list):
+                turns = turns_res["data"]
+                last_turn = turns[0] if turns else {}
+            else:
+                last_turn = {}
+        else:
+            last_turn = turns[-1] if turns else {}
+
+        if not res and not turns:
+            return {}
+
+        is_capacity = cls.is_capacity_error(last_turn)
         return {
             "status_type": status_type,
             "turns_count": len(turns),
             "last_turn_id": last_turn.get("id"),
             "last_turn_status": last_turn.get("status"),
+            "last_turn_error": last_turn.get("error"),
+            "is_capacity_error": is_capacity,
         }
 
     @classmethod
@@ -1672,8 +1715,10 @@ def run_watch_loop(
                             continue
                         live = SessionManager.get_live_thread_state(tid)
                         turn = live.get("last_turn_id")
+                        is_completed = live.get("last_turn_status") == "completed"
+                        is_capacity = live.get("is_capacity_error", False)
                         if (live.get("status_type") != "idle" or not turn or
-                                live.get("last_turn_status") != "completed"):
+                                not (is_completed or is_capacity)):
                             idle_since.pop(tid, None)
                             continue
                         now = time.monotonic()
@@ -1690,6 +1735,9 @@ def run_watch_loop(
                         if SessionManager.send_continue_prompt(tid, continue_prompt):
                             last_continued_turn[tid] = turn
                             idle_since.pop(tid, None)
+                            if is_capacity:
+                                log(f"会话 [{tid[:8]}] 出现模型容量限制 (at capacity)，已自动发送「{continue_prompt}」重试继续任务。")
+                                send_notification("Codex 模型容量重试", f"会话 [{tid[:8]}] 模型容量受限，已自动发送「{continue_prompt}」继续任务。")
             time.sleep(interval)
     except KeyboardInterrupt:
         # Keep quota-paused clients stopped. Restart can recover them from disk.
@@ -2118,6 +2166,7 @@ class CodexTopDashboard:
                 "turns_count": len(turns) if turns else (live.get("turns_count") or 0),
                 "last_turn_id": live.get("last_turn_id"),
                 "last_turn_status": live.get("last_turn_status"),
+                "is_capacity_error": live.get("is_capacity_error", False),
                 "turns": turns,
                 "is_subagent": SessionManager.is_subagent(tid),
             })
@@ -2218,7 +2267,10 @@ class CodexTopDashboard:
                 if matched_thread:
                     th_title = matched_thread["title"]
                     turns_cnt = str(matched_thread["turns_count"])
-                    turn_st = str(matched_thread["last_turn_status"] or matched_thread["status_type"])
+                    if matched_thread.get("is_capacity_error"):
+                        turn_st = "at capacity"
+                    else:
+                        turn_st = str(matched_thread["last_turn_status"] or matched_thread["status_type"])
 
                 cpu_fmt = f"{p['cpu_pct']:.1f}%"
                 mem_fmt = f"{p['mem_mb']:.1f}M"
@@ -2372,7 +2424,10 @@ class CodexTopDashboard:
                 if matched_thread:
                     th_title = matched_thread["title"]
                     turns_cnt = str(matched_thread["turns_count"])
-                    turn_st = str(matched_thread["last_turn_status"] or matched_thread["status_type"])
+                    if matched_thread.get("is_capacity_error"):
+                        turn_st = "at capacity"
+                    else:
+                        turn_st = str(matched_thread["last_turn_status"] or matched_thread["status_type"])
 
                 pad_line(cur_row, 0, "")
                 safe_addstr(cur_row, 1, f"{p['pid']:<8}")
@@ -2380,7 +2435,8 @@ class CodexTopDashboard:
                 safe_addstr(cur_row, 20, f"{p['cpu_pct']:>4.1f}% ")
                 safe_addstr(cur_row, 27, f"{p['mem_mb']:>5.1f}M ")
                 safe_addstr(cur_row, 35, f"#{turns_cnt:<5}")
-                safe_addstr(cur_row, 42, f"{turn_st:<12}")
+                turn_attr = c_pair(2) | curses.A_BOLD if matched_thread and matched_thread.get("is_capacity_error") else 0
+                safe_addstr(cur_row, 42, f"{turn_st:<12}", turn_attr)
                 safe_addstr(cur_row, 55, th_title[:max(10, maxx-56)])
                 cur_row += 1
 

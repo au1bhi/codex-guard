@@ -201,6 +201,31 @@ class TestSessionManager(unittest.TestCase):
             mock_send.assert_called_once_with("thread-002", "继续")
             self.assertEqual(len(res["sessions"]), 2)
 
+    def test_is_capacity_error(self):
+        t1 = {
+            "status": "failed",
+            "error": {
+                "message": "Selected model is at capacity. Please try a different model.",
+                "codexErrorInfo": "serverOverloaded"
+            }
+        }
+        self.assertTrue(cg.SessionManager.is_capacity_error(t1))
+
+        t2 = {"status": "failed", "error": {"codex_error_info": "server_overloaded"}}
+        self.assertTrue(cg.SessionManager.is_capacity_error(t2))
+
+        t3 = {"status": "failed", "error": "Selected model is at capacity."}
+        self.assertTrue(cg.SessionManager.is_capacity_error(t3))
+
+        t4 = {"status": "failed", "items": [{"text": "Selected model is at capacity. Please try a different model."}]}
+        self.assertTrue(cg.SessionManager.is_capacity_error(t4))
+
+        t5 = {"status": "failed", "error": {"message": "Invalid token"}}
+        self.assertFalse(cg.SessionManager.is_capacity_error(t5))
+
+        t6 = {"status": "completed", "items": [{"text": "done"}]}
+        self.assertFalse(cg.SessionManager.is_capacity_error(t6))
+
     def test_subagent_detection_and_resolution(self):
         # thread-001 is root
         self.assertFalse(cg.SessionManager.is_subagent("thread-001"))
@@ -478,6 +503,76 @@ class TestWatchLoopSimulation(unittest.TestCase):
                 pass
 
             mock_send.assert_called_with("tid-idle", "继续")
+
+    def test_auto_continue_on_capacity_error(self):
+        """Simulate turn failed due to capacity error -> verify send_continue_prompt is sent"""
+        raw_healthy = {
+            "rateLimits": {
+                "primary": {"windowDurationMins": 300, "usedPercent": 5.0, "resetsAt": int(time.time() + 18000)}
+            }
+        }
+        live_cap = {
+            "status_type": "idle",
+            "last_turn_id": "turn-cap-1",
+            "last_turn_status": "failed",
+            "is_capacity_error": True
+        }
+
+        call_count = [0]
+        def fake_sleep(duration):
+            call_count[0] += 1
+            if call_count[0] >= 2:
+                raise KeyboardInterrupt()
+
+        with patch.object(cg.CodexSocketClient, "query_rate_limits", return_value=raw_healthy), \
+             patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[(1001, "S", "codex")]), \
+             patch.object(cg.SessionManager, "get_loaded_thread_ids", return_value=["tid-cap"]), \
+             patch.object(cg.SessionManager, "get_live_thread_state", return_value=live_cap), \
+             patch.object(cg.SessionManager, "send_continue_prompt", return_value=True) as mock_send, \
+             patch.object(cg, "send_notification") as mock_notif, \
+             patch("time.sleep", side_effect=fake_sleep):
+
+            try:
+                cg.run_watch_loop(threshold=3.0, interval=1, idle_delay=0)
+            except KeyboardInterrupt:
+                pass
+
+            mock_send.assert_called_with("tid-cap", "继续")
+            mock_notif.assert_called()
+
+    def test_no_auto_continue_on_non_capacity_failed_turn(self):
+        """Simulate turn failed due to other error -> verify send_continue_prompt is NOT sent"""
+        raw_healthy = {
+            "rateLimits": {
+                "primary": {"windowDurationMins": 300, "usedPercent": 5.0, "resetsAt": int(time.time() + 18000)}
+            }
+        }
+        live_other_fail = {
+            "status_type": "idle",
+            "last_turn_id": "turn-fail-other",
+            "last_turn_status": "failed",
+            "is_capacity_error": False
+        }
+
+        call_count = [0]
+        def fake_sleep(duration):
+            call_count[0] += 1
+            if call_count[0] >= 2:
+                raise KeyboardInterrupt()
+
+        with patch.object(cg.CodexSocketClient, "query_rate_limits", return_value=raw_healthy), \
+             patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[(1001, "S", "codex")]), \
+             patch.object(cg.SessionManager, "get_loaded_thread_ids", return_value=["tid-fail"]), \
+             patch.object(cg.SessionManager, "get_live_thread_state", return_value=live_other_fail), \
+             patch.object(cg.SessionManager, "send_continue_prompt", return_value=True) as mock_send, \
+             patch("time.sleep", side_effect=fake_sleep):
+
+            try:
+                cg.run_watch_loop(threshold=3.0, interval=1, idle_delay=0)
+            except KeyboardInterrupt:
+                pass
+
+            mock_send.assert_not_called()
 
 
 class TestToolProcessTermination(unittest.TestCase):
