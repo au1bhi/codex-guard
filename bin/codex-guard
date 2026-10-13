@@ -46,6 +46,15 @@ SERVICE_NAME = "codex-quota-guard"
 SERVICE_FILE = os.path.expanduser(f"~/.config/systemd/user/{SERVICE_NAME}.service")
 
 
+def current_boot_id() -> str:
+    """获取当前 Linux 系统本次开机的唯一 boot_id"""
+    try:
+        with open("/proc/sys/kernel/random/boot_id", "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
 def safe_text(value) -> str:
     """Prevent untrusted titles, tool output and prompts from emitting terminal controls."""
     return "".join(c if c.isprintable() else " " for c in str(value))
@@ -455,7 +464,7 @@ class CodexSocketClient:
                 pass
 
     @classmethod
-    def query_rate_limits(cls, timeout: float = 6.0) -> Optional[Dict[str, Any]]:
+    def query_rate_limits(cls, timeout: float = 12.0) -> Optional[Dict[str, Any]]:
         return cls.query_app_server("account/rateLimits/read", {}, timeout)
 
     @classmethod
@@ -688,35 +697,54 @@ class SessionManager:
         返回被中断的 turn 列表: [{'threadId': tid, 'turnId': turn_id, 'title': ...}]
         """
         interrupted = []
-        loaded_ids = cls.get_loaded_thread_ids()
+        loaded_ids = list(cls.get_loaded_thread_ids())
+        lock_dir = os.path.join(CODEX_HOME, "thread-writer-locks")
+        if os.path.exists(lock_dir):
+            try:
+                for fname in os.listdir(lock_dir):
+                    if fname.endswith(".lock") and not fname.startswith("."):
+                        tid = fname[:-5]
+                        if tid and tid not in loaded_ids:
+                            loaded_ids.append(tid)
+            except Exception:
+                pass
+
         for tid in loaded_ids:
             try:
-                res = CodexSocketClient.query_app_server("thread/read", {"threadId": tid, "includeTurns": True})
-                if not res or not isinstance(res, dict):
+                res = CodexSocketClient.query_app_server("thread/read", {"threadId": tid, "includeTurns": True}, timeout=8.0)
+                turns = []
+                if isinstance(res, dict):
+                    turns = res.get("thread", {}).get("turns", [])
+                if not turns:
+                    turns_res = CodexSocketClient.query_app_server("thread/turns/list", {"threadId": tid}, timeout=4.0)
+                    if isinstance(turns_res, dict) and isinstance(turns_res.get("data"), list):
+                        turns = turns_res["data"]
+
+                if not turns:
                     continue
-                thread = res.get("thread", {})
-                status = thread.get("status", {})
-                status_type = status.get("type") if isinstance(status, dict) else str(status)
-                turns = thread.get("turns", [])
-                if turns:
-                    last_turn = turns[-1]
-                    turn_st = last_turn.get("status")
-                    turn_id = last_turn.get("id")
-                    if turn_st == "inProgress":
-                        if turn_id:
-                            result = CodexSocketClient.query_app_server("turn/interrupt", {"threadId": tid, "turnId": turn_id})
-                            if result is None:
-                                log(f"中断会话 [{tid[:8]}] 失败，无法确认后台任务已停止。")
-                                continue
-                            tinfo = cls.get_thread_info(tid)
-                            title = tinfo.get("title", tid[:8]) if tinfo else tid[:8]
-                            log(f"🛑 [额度拦截] 已掐断会话 [{title}] (Turn #{len(turns)}) 的后台运行: 已向 App-Server 发送 turn/interrupt！服务器已确认中断请求。")
-                            interrupted.append({
-                                "threadId": tid,
-                                "turnId": turn_id,
-                                "title": title,
-                                "turns_count": len(turns)
-                            })
+
+                active_turn = None
+                for turn in reversed(turns):
+                    if isinstance(turn, dict) and turn.get("status") in ("inProgress", "running", "started", "pending"):
+                        active_turn = turn
+                        break
+
+                if active_turn:
+                    turn_id = active_turn.get("id")
+                    if turn_id:
+                        result = CodexSocketClient.query_app_server("turn/interrupt", {"threadId": tid, "turnId": turn_id}, timeout=6.0)
+                        if result is None:
+                            log(f"中断会话 [{tid[:8]}] 失败，无法确认后台任务已停止。")
+                            continue
+                        tinfo = cls.get_thread_info(tid)
+                        title = tinfo.get("title", tid[:8]) if tinfo else tid[:8]
+                        log(f"🛑 [额度拦截] 已掐断会话 [{title}] (Turn ID: {turn_id[:8]}) 的后台运行: 已向 App-Server 发送 turn/interrupt！服务器已确认中断请求。")
+                        interrupted.append({
+                            "threadId": tid,
+                            "turnId": turn_id,
+                            "title": title,
+                            "turns_count": len(turns)
+                        })
             except Exception as e:
                 log(f"掐断会话 [{tid[:8]}] 异常: {e}")
         return interrupted
@@ -772,6 +800,7 @@ class SessionManager:
 
         snapshot = {
             "timestamp": time.time(),
+            "boot_id": current_boot_id(),
             "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "reason": reason,
             "active_pids": active_pids,
@@ -1495,6 +1524,9 @@ def run_watch_loop(
     send_notification("Codex 额度守护已启动", "监测 5h 与周额度；数据不可用时暂停，验证恢复后唤醒。")
     last_continued_turn = {}
     idle_since = {}
+    last_valid_snap: Optional[QuotaSnapshot] = None
+    last_valid_time: float = 0.0
+    consecutive_invalid: int = 0
     auto_reasons = {"quota_exceeded", "quota_low", "quota_unavailable"}
     try:
         while True:
@@ -1504,14 +1536,39 @@ def run_watch_loop(
             if not enabled:
                 idle_since.clear()
             previous = read_snapshot()
+            boot_id = current_boot_id()
+            if previous.get("boot_id") and boot_id and previous.get("boot_id") != boot_id:
+                # 机器重启后，旧会话已不属于当前开机周期，清理旧原因，严禁开机时桌面弹窗
+                if previous.get("reason") in auto_reasons:
+                    previous["reason"] = "stale_boot_reset"
+                    write_snapshot(previous, automatic=True)
+                previous = {}
+
             manual_pause = previous.get("reason") in {"manual_pause", "manual_top_pause", "manual_stopped"}
             snap = QuotaSnapshot(CodexSocketClient.query_rate_limits())
+            now = time.monotonic()
+            if snap.valid:
+                last_valid_snap = snap
+                last_valid_time = now
+                consecutive_invalid = 0
+            else:
+                consecutive_invalid += 1
+                # 缓存与防抖机制：若在 90 秒内有有效额度快照且额度充足，视为单次网络/socket 偶发延迟，不立即触发暂停
+                if last_valid_snap and (now - last_valid_time < 90.0) and consecutive_invalid < 4:
+                    if last_valid_snap.protection_remaining > threshold:
+                        time.sleep(interval)
+                        continue
+
             if manual_pause:
                 # A manual stop/pause always wins over automatic continuation.
                 time.sleep(interval)
                 continue
-            if not snap.valid or snap.protection_remaining <= threshold:
-                reason = "quota_exceeded" if snap.valid else "quota_unavailable"
+
+            effective_remaining = snap.protection_remaining if snap.valid else (last_valid_snap.protection_remaining if last_valid_snap else 0.0)
+            is_depleted = (snap.valid and snap.protection_remaining <= threshold) or (not snap.valid and (not last_valid_snap or effective_remaining <= threshold or consecutive_invalid >= 4 or now - last_valid_time >= 90.0))
+
+            if is_depleted:
+                reason = "quota_exceeded" if snap.valid or (last_valid_snap and last_valid_snap.protection_remaining <= threshold) else "quota_unavailable"
                 interrupted = SessionManager.interrupt_active_turns()
                 if interrupted:
                     SessionManager.kill_orphaned_tool_subprocesses()
@@ -1571,16 +1628,18 @@ def run_watch_loop(
                 targets += previous.get("loaded_thread_ids", [])
                 roots = list(dict.fromkeys(SessionManager.get_root_thread_id(tid) for tid in targets if isinstance(tid, str) and tid))
                 loaded = set(SessionManager.get_loaded_thread_ids()) if running else set()
-                for tid in roots:
-                    if tid in loaded or SessionManager.is_subagent(tid):
-                        continue
-                    if read_snapshot().get("reason") not in auto_reasons:
-                        failed = True
-                        break
-                    if SessionManager.launch_codex_session(tid, prompt=continue_prompt if get_auto_continue(auto_continue) else ""):
-                        launched.append(tid)
-                    else:
-                        failed = True
+                is_stale_boot = bool(previous.get("boot_id") and boot_id and previous.get("boot_id") != boot_id)
+                if not is_stale_boot:
+                    for tid in roots:
+                        if tid in loaded or SessionManager.is_subagent(tid):
+                            continue
+                        if read_snapshot().get("reason") not in auto_reasons:
+                            failed = True
+                            break
+                        if SessionManager.launch_codex_session(tid, prompt=continue_prompt if get_auto_continue(auto_continue) else ""):
+                            launched.append(tid)
+                        else:
+                            failed = True
                 if launched:
                     time.sleep(2)
                 result = SessionManager.restore_and_verify_sessions(

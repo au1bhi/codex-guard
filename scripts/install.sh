@@ -26,9 +26,9 @@ mkdir -p "${SERVICE_DIR}"
 # Keep systemd specifiers; shell substitution breaks homes containing &, | or %.
 install -m 0644 "${DIR}/systemd/codex-quota-guard.service" "${SERVICE_DIR}/codex-quota-guard.service"
 systemctl --user daemon-reload
-systemctl --user enable codex-quota-guard.service
-systemctl --user restart codex-quota-guard.service
-echo "✓ Installed and started systemd user service: codex-quota-guard.service"
+# 默认不自动开启开机自启，防止每次开机意外拉起/弹窗；按需运行 codex-guard service enable 开启自启
+systemctl --user disable codex-quota-guard.service 2>/dev/null || true
+echo "✓ Installed systemd user service: codex-quota-guard.service (autostart disabled by default)"
 
 echo ""
 echo "=== Installation Complete ==="

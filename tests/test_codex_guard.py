@@ -608,6 +608,86 @@ class TestCmdStop(unittest.TestCase):
             cg.cmd_fix_mouse(None)
             mock_reset.assert_called_once()
 
+    def test_quota_debounce_prevents_flapping_on_transient_none(self):
+        """Verify that a single transient None query does NOT trigger pause when cached quota is healthy"""
+        healthy_raw = {
+            "rateLimits": {
+                "planType": "plus",
+                "credits": {"hasCredits": True, "balance": "100.0"},
+                "primary": {"windowDurationMins": 300, "usedPercent": 50.0, "resetsAt": int(time.time() + 60)}
+            }
+        }
+        # Iteration 1: healthy -> cache populated
+        # Iteration 2: transient None (timeout) -> debounced, no pause!
+        # Iteration 3: stop
+        call_count = 0
+        def query_side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return healthy_raw
+            return None
+
+        with patch.object(cg.CodexSocketClient, "query_rate_limits", side_effect=query_side_effect), \
+             patch.object(cg.SessionManager, "interrupt_active_turns") as mock_interrupt, \
+             patch.object(cg.ProcessManager, "suspend_pid") as mock_suspend, \
+             patch("time.sleep", side_effect=[None, KeyboardInterrupt]):
+
+            try:
+                cg.run_watch_loop(threshold=3.0, interval=1)
+            except KeyboardInterrupt:
+                pass
+
+            mock_interrupt.assert_not_called()
+            mock_suspend.assert_not_called()
+
+    def test_stale_boot_snapshot_does_not_auto_launch_on_boot(self):
+        """Verify that a snapshot from a previous boot session is NOT auto-launched on reboot"""
+        old_snapshot = {
+            "boot_id": "old-boot-id-12345",
+            "reason": "quota_exceeded",
+            "sessions": [{"id": "t-reboot", "title": "Old Task"}],
+            "interrupted_turns": [{"threadId": "t-reboot", "turnId": "turn-old"}],
+            "loaded_thread_ids": ["t-reboot"],
+            "active_pids": [9999]
+        }
+        with open(self.snap_file, "w") as f:
+            json.dump(old_snapshot, f)
+
+        healthy_raw = {
+            "rateLimits": {
+                "planType": "plus",
+                "credits": {"hasCredits": True, "balance": "100.0"},
+                "primary": {"windowDurationMins": 300, "usedPercent": 10.0, "resetsAt": int(time.time() + 60)}
+            }
+        }
+        with patch.object(cg, "current_boot_id", return_value="new-boot-id-67890"), \
+             patch.object(cg.CodexSocketClient, "query_rate_limits", return_value=healthy_raw), \
+             patch.object(cg.SessionManager, "launch_codex_session") as mock_launch, \
+             patch("time.sleep", side_effect=KeyboardInterrupt):
+
+            try:
+                cg.run_watch_loop(threshold=3.0, interval=1)
+            except KeyboardInterrupt:
+                pass
+
+            mock_launch.assert_not_called()
+
+    def test_interrupt_active_turns_via_fast_turns_list(self):
+        """Verify that interrupt_active_turns intercepts in-progress turns from thread/turns/list"""
+        with patch.object(cg.SessionManager, "get_loaded_thread_ids", return_value=["tid-fast"]), \
+             patch.object(cg.CodexSocketClient, "query_app_server", side_effect=[
+                 None,  # thread/read fails or times out
+                 {"data": [{"id": "turn-fast-1", "status": "inProgress"}]},  # thread/turns/list succeeds
+                 {"result": "ok"}  # turn/interrupt succeeds
+             ]):
+
+            interrupted = cg.SessionManager.interrupt_active_turns()
+            self.assertEqual(len(interrupted), 1)
+            self.assertEqual(interrupted[0]["turnId"], "turn-fast-1")
+            self.assertEqual(interrupted[0]["threadId"], "tid-fast")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
