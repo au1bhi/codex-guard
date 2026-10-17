@@ -1,5 +1,5 @@
 """Monitoring regressions with fake RPC data and an isolated PTY reload."""
-import os, pty, runpy, select, struct, subprocess, sys, tempfile, termios, fcntl, time, unittest
+import io, os, pty, runpy, select, struct, subprocess, sys, tempfile, termios, fcntl, time, unittest
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,6 +16,62 @@ def data():
     return dict(snapshot=None,processes=[],threads=[],service_active=False,service_pid='0',auto_continue_enabled=False,uptime='up',load='0',time_str='now')
 
 class Regression(unittest.TestCase):
+    def test_collector_failure_invalidates_previous_healthy_data(self):
+        dash=D(delay=.001)
+        previous=data()
+        previous['snapshot']=m['QuotaSnapshot']({'rateLimits':{'primary':{'usedPercent':1,'windowDurationMins':300}}})
+        dash._cached_data=previous
+        def fail():
+            dash._stop_event.set()
+            raise RuntimeError('private error details\x1b[2J')
+        with patch.object(dash,'collect_data',side_effect=fail):dash._background_collector()
+        state=dash.get_snapshot()
+        self.assertIsNone(state['snapshot']);self.assertFalse(state['loading'])
+        self.assertEqual(state['collection_error'],'RuntimeError')
+        output=io.StringIO();dash.render_batch_from_data(state,output)
+        self.assertIn('采集失败',output.getvalue());self.assertIn('数据不可用',output.getvalue())
+        self.assertNotIn('5h Quota:',output.getvalue());self.assertNotIn('private error',output.getvalue())
+        self.assertNotIn('No active Codex',output.getvalue())
+
+    def test_collector_recovers_after_failure(self):
+        dash=D(delay=.001)
+        healthy=data()
+        calls=0
+        def collect():
+            nonlocal calls
+            calls+=1
+            if calls==1:
+                raise RuntimeError('failure')
+            dash._stop_event.set()
+            self.assertEqual(dash._cached_data['collection_error'],'RuntimeError')
+            return healthy
+        with patch.object(dash,'collect_data',side_effect=collect):
+            dash._background_collector()
+        self.assertIs(dash.get_snapshot(),healthy)
+        self.assertNotIn('collection_error',dash.get_snapshot())
+
+    def test_synchronous_collection_failure_is_visible(self):
+        dash=D()
+        with patch.object(dash,'collect_data',side_effect=ValueError('untrusted response')):
+            output=io.StringIO();dash.render_batch(output)
+        self.assertIn('采集失败',output.getvalue())
+        self.assertNotIn('untrusted response',output.getvalue())
+
+    def test_curses_collection_failure_and_unknown_controls(self):
+        state=D.unavailable_snapshot(error=RuntimeError())
+        screen=Screen()
+        with patch.object(m['curses'],'color_pair',return_value=0):
+            D().draw_curses_screen(screen,state,30,180)
+            self.assertIn('采集失败',screen.rows[1]);self.assertIn('数据不可用',screen.rows[6])
+            small=Screen();D().draw_curses_screen(small,state,5,60)
+        self.assertIn('UNKNOWN',small.rows[2]);self.assertIn('UNKNOWN',small.rows[3])
+
+    def test_loading_does_not_claim_no_clients_exist(self):
+        state=D.unavailable_snapshot(loading=True)
+        output=io.StringIO();D().render_batch_from_data(state,output)
+        self.assertIn('正在读取进程',output.getvalue())
+        self.assertNotIn('No active Codex',output.getvalue())
+
     def test_ephemeral_metadata_only(self):
         reply={'thread':{'ephemeral':True,'status':{'type':'idle'},'name':'temporary','cwd':'/tmp'}}
         with patch.object(C,'query_app_server',return_value=reply) as rpc:

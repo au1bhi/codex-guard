@@ -2091,14 +2091,23 @@ class CodexTopDashboard:
         while not self._stop_event.is_set():
             try:
                 new_data = self.collect_data()
-                with self._data_lock:
-                    self._cached_data = new_data
-            except Exception:
-                pass
+            except Exception as error:
+                new_data = self.unavailable_snapshot(error=error)
+            with self._data_lock:
+                self._cached_data = new_data
 
             # 等待 self.delay 秒或等待强制刷新信号
             self._force_refresh_event.wait(timeout=self.delay)
             self._force_refresh_event.clear()
+
+    @staticmethod
+    def unavailable_snapshot(loading=False, error=None):
+        """Unknown observations must not be presented as previous healthy data."""
+        return {"snapshot": None, "loading": loading,
+                "collection_error": type(error).__name__ if error is not None else None,
+                "processes": [], "threads": [], "uptime": "", "load": "…",
+                "service_active": None, "service_pid": "N/A",
+                "auto_continue_enabled": None, "time_str": time.strftime("%H:%M:%S")}
 
     def get_snapshot(self) -> Dict[str, Any]:
         """获取最新的指标快照 (非阻塞极速返回)"""
@@ -2107,11 +2116,11 @@ class CodexTopDashboard:
                 return self._cached_data
         if self._worker_thread and self._worker_thread.is_alive():
             # Render immediately while the sole collector waits for RPC/network IO.
-            return {"snapshot": None, "loading": True, "processes": [], "threads": [],
-                    "uptime": "", "load": "…", "service_active": None,
-                    "service_pid": "N/A", "auto_continue_enabled": None,
-                    "time_str": time.strftime("%H:%M:%S")}
-        data = self.collect_data()
+            return self.unavailable_snapshot(loading=True)
+        try:
+            data = self.collect_data()
+        except Exception as error:
+            data = self.unavailable_snapshot(error=error)
         with self._data_lock:
             self._cached_data = data
         return data
@@ -2250,7 +2259,17 @@ class CodexTopDashboard:
 
     @staticmethod
     def quota_notice(data):
+        if data.get("collection_error"):
+            return f"数据采集失败（{safe_text(data['collection_error'])}）；额度不可用，请按 r 重试"
         return "额度读取中…" if data.get("loading") else "额度不可用（查询失败或数据无效）；请检查连接后刷新"
+
+    @staticmethod
+    def empty_process_notice(data):
+        if data.get("loading"):
+            return "正在读取进程与会话…"
+        if data.get("collection_error"):
+            return "进程和会话数据不可用（采集失败）"
+        return "(No active Codex client process detected)"
 
     def render_batch_from_data(self, d: Dict[str, Any], out=sys.stdout):
         """根据提供的数据快照格式化并输出到终端"""
@@ -2294,7 +2313,7 @@ class CodexTopDashboard:
 
         out.write(f"{BG_GRAY} PID      STATE     CPU%   MEM     TURNS  STATUS       ACTIVE SESSION / TASK TITLE                  {RESET}\n")
         if not d["processes"]:
-            out.write(" (No active Codex client process detected)\n")
+            out.write(f" {self.empty_process_notice(d)}\n")
         else:
             for p in d["processes"]:
                 st_str = f"{RED}STOPPED{RESET}" if p["state"] == "T" else f"{GREEN}RUNNING{RESET}"
@@ -2399,9 +2418,10 @@ class CodexTopDashboard:
                 safe_addstr(1, 0, f"5h: {snap.used_percent:.0f}% used | {snap.remaining_percent:.0f}% left")
             else:
                 pad_line(1, 0, self.quota_notice(data), c_pair(2))
-            safe_addstr(2, 0, f"[g] 守护: {'ON' if data.get('service_active') else 'OFF'}")
+            active = data.get("service_active")
+            safe_addstr(2, 0, f"[g] 守护: {'ON' if active is True else 'OFF' if active is False else 'UNKNOWN'}")
             automatic = data.get("auto_continue_enabled")
-            safe_addstr(3, 0, f"[a] 自动继续: {'ON' if automatic else 'OFF'} [q]退出")
+            safe_addstr(3, 0, f"[a] 自动继续: {'ON' if automatic is True else 'OFF' if automatic is False else 'UNKNOWN'} [q]退出")
             return
 
         # 1. 顶部 Header
@@ -2449,7 +2469,7 @@ class CodexTopDashboard:
 
         cur_row = 6
         if not data["processes"]:
-            pad_line(cur_row, 0, "  (No active Codex client process detected)", curses.A_DIM)
+            pad_line(cur_row, 0, "  " + self.empty_process_notice(data), curses.A_DIM)
             cur_row += 1
         else:
             for p in data["processes"]:
