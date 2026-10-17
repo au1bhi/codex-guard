@@ -666,30 +666,45 @@ class SessionManager:
     @classmethod
     def get_live_thread_state(cls, thread_id: str) -> Dict[str, Any]:
         """获取指定会话的实时运行状态（status, turns 等）"""
-        res = CodexSocketClient.query_app_server("thread/read", {"threadId": thread_id, "includeTurns": True})
-        thread = {}
-        if isinstance(res, dict):
-            thread = res.get("thread", {})
+        # Ephemeral threads expose metadata but reject both history endpoints.
+        res = CodexSocketClient.query_app_server("thread/read", {"threadId": thread_id, "includeTurns": False})
+        if not isinstance(res, dict) or not isinstance(res.get("thread"), dict):
+            return {}
+        thread = res["thread"]
+        ephemeral = thread.get("ephemeral") is True
+        history_available = False
+        turns = []
+        if not ephemeral:
+            history = CodexSocketClient.query_app_server("thread/read", {"threadId": thread_id, "includeTurns": True})
+            if isinstance(history, dict) and isinstance(history.get("thread"), dict):
+                thread = history["thread"]
+                turns = thread.get("turns", [])
+                history_available = isinstance(turns, list)
+                turns = turns if history_available else []
         status = thread.get("status", {})
         status_type = status.get("type") if isinstance(status, dict) else str(status)
-        turns = thread.get("turns", [])
-        if not turns:
+        if not turns and not ephemeral:
             turns_res = CodexSocketClient.query_app_server("thread/turns/list", {"threadId": thread_id}, timeout=4.0)
             if isinstance(turns_res, dict) and isinstance(turns_res.get("data"), list):
                 turns = turns_res["data"]
+                history_available = True
                 last_turn = turns[0] if turns else {}
+                # History-list results are newest first; render chronologically.
+                turns = list(reversed(turns))
             else:
                 last_turn = {}
         else:
             last_turn = turns[-1] if turns else {}
 
-        if not res and not turns:
-            return {}
-
         is_capacity = cls.is_capacity_error(last_turn)
         return {
             "status_type": status_type,
-            "turns_count": len(turns),
+            "turns_count": len(turns) if history_available else None,
+            "turns": turns,
+            "history_available": history_available,
+            "ephemeral": ephemeral,
+            "title": safe_text(thread.get("name") or thread.get("preview") or ("(临时会话)" if ephemeral else "(未命名任务)")),
+            "cwd": safe_text(thread.get("cwd") or ""),
             "last_turn_id": last_turn.get("id"),
             "last_turn_status": last_turn.get("status"),
             "last_turn_error": last_turn.get("error"),
@@ -1320,7 +1335,11 @@ def cmd_status(args):
             live = SessionManager.get_live_thread_state(tid)
             st_type = live.get("status_type", "unknown")
             turns_cnt = live.get("turns_count", 0)
-            if st_type == "active":
+            if live.get("ephemeral"):
+                st_badge = f"临时会话：{st_type}（回合历史不可用）"
+            elif not live.get("history_available", True):
+                st_badge = f"{st_type}（回合历史不可用）"
+            elif st_type == "active":
                 st_badge = f"{green}运行中 (第 {turns_cnt} 轮推进中){reset}"
             elif st_type == "idle":
                 st_badge = f"{yellow}空闲就绪 (第 {turns_cnt} 轮已完成){reset}"
@@ -1329,8 +1348,8 @@ def cmd_status(args):
             else:
                 st_badge = f"{st_type}"
 
-            title = info['title'] if info else "(未命名任务)"
-            cwd = safe_text(info['cwd']) if info else ""
+            title = info['title'] if info else live.get("title", "(未命名任务)")
+            cwd = safe_text(info['cwd']) if info else live.get("cwd", "")
             print(f"  • {bold}{title}{reset} (ID: {tid[:8]}...) [{st_badge}] [工作目录: {cwd}]")
 
     # 检查 systemd 服务状态
@@ -1935,6 +1954,7 @@ class CodexTopDashboard:
         self._stop_event = threading.Event()
         self._force_refresh_event = threading.Event()
         self._worker_thread = None
+        self._reload_requested = False
         try:
             self.init_mtime = os.path.getmtime(os.path.realpath(__file__))
         except Exception:
@@ -2048,20 +2068,19 @@ class CodexTopDashboard:
         return f"[g] 守护: {guard} | [a] 自动继续: {automatic}"
 
     def check_and_reload(self) -> bool:
-        """若检测到磁盘上的脚本文件被更新，自动重新执行当前进程以热加载最新逻辑"""
+        """Request reload after the event loop has restored its terminal state."""
         try:
             cur_path = os.path.realpath(__file__)
             if os.path.exists(cur_path) and os.path.getmtime(cur_path) > self.init_mtime:
-                try:
-                    if curses and not curses.isendwin():
-                        curses.endwin()
-                except Exception:
-                    pass
-                os.execv(sys.executable, [sys.executable, cur_path] + sys.argv[1:])
+                self._reload_requested = True
                 return True
         except Exception:
             pass
         return False
+
+    def reload_if_requested(self):
+        if self._reload_requested:
+            os.execv(sys.executable, [sys.executable, os.path.realpath(__file__)] + sys.argv[1:])
 
     def set_flash(self, msg: str):
         self.flash_message = safe_text(msg)
@@ -2086,6 +2105,12 @@ class CodexTopDashboard:
         with self._data_lock:
             if self._cached_data is not None:
                 return self._cached_data
+        if self._worker_thread and self._worker_thread.is_alive():
+            # Render immediately while the sole collector waits for RPC/network IO.
+            return {"snapshot": None, "loading": True, "processes": [], "threads": [],
+                    "uptime": "", "load": "…", "service_active": None,
+                    "service_pid": "N/A", "auto_continue_enabled": None,
+                    "time_str": time.strftime("%H:%M:%S")}
         data = self.collect_data()
         with self._data_lock:
             self._cached_data = data
@@ -2149,21 +2174,17 @@ class CodexTopDashboard:
         loaded_threads = SessionManager.get_loaded_thread_ids()
         sorted_threads = sorted(loaded_threads, key=lambda tid: 1 if SessionManager.is_subagent(tid) else 0)
         threads_info = []
-        for idx, tid in enumerate(sorted_threads):
+        for tid in sorted_threads:
             info = SessionManager.get_thread_info(tid)
             live = SessionManager.get_live_thread_state(tid)
-            need_turns = (idx == 0)
-            turns = []
-            if need_turns:
-                res = CodexSocketClient.query_app_server("thread/read", {"threadId": tid, "includeTurns": True})
-                if res and isinstance(res, dict) and "thread" in res:
-                    turns = res["thread"].get("turns", [])
+            turns = live.get("turns", [])
             threads_info.append({
                 "id": tid,
-                "title": info.get("title", "(未命名任务)") if info else "(未命名任务)",
-                "cwd": info.get("cwd", "") if info else "",
+                "title": info.get("title", "(未命名任务)") if info else live.get("title", "(未命名任务)"),
+                "cwd": info.get("cwd", "") if info else live.get("cwd", ""),
                 "status_type": live.get("status_type", "unknown"),
-                "turns_count": len(turns) if turns else (live.get("turns_count") or 0),
+                "turns_count": live.get("turns_count"),
+                "ephemeral": live.get("ephemeral", False),
                 "last_turn_id": live.get("last_turn_id"),
                 "last_turn_status": live.get("last_turn_status"),
                 "is_capacity_error": live.get("is_capacity_error", False),
@@ -2208,6 +2229,29 @@ class CodexTopDashboard:
             "time_str": time.strftime("%H:%M:%S"),
         }
 
+    @staticmethod
+    def match_process_thread(process, threads):
+        # A loaded thread alone is not evidence that a particular PID owns it.
+        matches = [t for t in threads if t.get("id") and t["id"] in process.get("cmd", "")]
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def reasoning_summary(item):
+        def texts(value):
+            if isinstance(value, str):
+                return [value] if value.strip() else []
+            if isinstance(value, list):
+                return [text for part in value for text in texts(part)]
+            if isinstance(value, dict):
+                return texts(value.get("text", ""))
+            return []
+        parts = texts(item.get("summary")) or texts(item.get("content"))
+        return safe_text(" ".join(parts)) if parts else "推理中（未提供可显示摘要）"
+
+    @staticmethod
+    def quota_notice(data):
+        return "额度读取中…" if data.get("loading") else "额度不可用（查询失败或数据无效）；请检查连接后刷新"
+
     def render_batch_from_data(self, d: Dict[str, Any], out=sys.stdout):
         """根据提供的数据快照格式化并输出到终端"""
         d = safe_display_data(d)
@@ -2244,6 +2288,8 @@ class CodexTopDashboard:
                 out.write(f"Week Quota: [{CYAN}{b_wk}{RESET}] {w_used:.1f}% used | {w_rem:.1f}% left | Credits: {BOLD}{snap.credit_balance}{RESET} (余额；未统计消费)\n")
 
             out.write(f"Plan: {snap.plan_type.upper()}\n")
+        else:
+            out.write(f"{YELLOW}{self.quota_notice(d)}{RESET}\n")
         out.write(self.control_status(d) + "\n\n")
 
         out.write(f"{BG_GRAY} PID      STATE     CPU%   MEM     TURNS  STATUS       ACTIVE SESSION / TASK TITLE                  {RESET}\n")
@@ -2255,18 +2301,13 @@ class CodexTopDashboard:
                 th_title = p["cmd"][:35]
                 turns_cnt = "-"
                 turn_st = "-"
-                matched_thread = None
-                for th in d.get("threads", []):
-                    if th["id"] in p["cmd"]:
-                        matched_thread = th
-                        break
-                if not matched_thread and d.get("threads"):
-                    root_threads = [th for th in d["threads"] if not th.get("is_subagent", False)]
-                    matched_thread = root_threads[0] if root_threads else d["threads"][0]
+                matched_thread = self.match_process_thread(p, d.get("threads", []))
+                if not matched_thread:
+                    th_title += " (会话未关联)"
 
                 if matched_thread:
                     th_title = matched_thread["title"]
-                    turns_cnt = str(matched_thread["turns_count"])
+                    turns_cnt = str(matched_thread["turns_count"]) if matched_thread["turns_count"] is not None else "-"
                     if matched_thread.get("is_capacity_error"):
                         turn_st = "at capacity"
                     else:
@@ -2286,7 +2327,7 @@ class CodexTopDashboard:
                 t_idx = len(turns)
                 t_st = last_turn.get("status", "inProgress")
                 st_color = GREEN if t_st == "inProgress" else YELLOW
-                out.write(f"{DIM}─── Live Turn Execution Stream (Turn #{t_idx} ─ {st_color}{t_st}{RESET}{DIM}, {len(items)} actions) ────────────────────────{RESET}\n")
+                out.write(f"{DIM}─── Live Turn Execution Stream: {t0.get('title', t0.get('id', ''))} (Turn #{t_idx} ─ {st_color}{t_st}{RESET}{DIM}, {len(items)} actions) ────────────────────────{RESET}\n")
                 for it in items[-8:]:
                     itype = it.get("type")
                     if itype == "commandExecution":
@@ -2296,7 +2337,7 @@ class CodexTopDashboard:
                         dur = f"{it.get('durationMs', 0)}ms" if it.get("durationMs") else ""
                         out.write(f"  • {BOLD}[CMD:{c_color}{c_st}{RESET}{BOLD}]{RESET} {cmd_txt[:70]} {DIM}{dur}{RESET}\n")
                     elif itype == "reasoning":
-                        out.write(f"  • {CYAN}[REASONING]{RESET} Deep model reasoning & kernel latency analysis...\n")
+                        out.write(f"  • {CYAN}[REASONING]{RESET} {self.reasoning_summary(it)}\n")
                     elif itype == "webSearch":
                         out.write(f"  • {YELLOW}[SEARCH]{RESET} {it.get('query', '')[:65]}\n")
                     elif itype == "message":
@@ -2356,6 +2397,8 @@ class CodexTopDashboard:
             safe_addstr(0, 0, " codex-top ", c_pair(6) | curses.A_BOLD)
             if snap:
                 safe_addstr(1, 0, f"5h: {snap.used_percent:.0f}% used | {snap.remaining_percent:.0f}% left")
+            else:
+                pad_line(1, 0, self.quota_notice(data), c_pair(2))
             safe_addstr(2, 0, f"[g] 守护: {'ON' if data.get('service_active') else 'OFF'}")
             automatic = data.get("auto_continue_enabled")
             safe_addstr(3, 0, f"[a] 自动继续: {'ON' if automatic else 'OFF'} [q]退出")
@@ -2370,6 +2413,8 @@ class CodexTopDashboard:
         safe_addstr(0, sentinel_pos, st_desc, st_color | curses.A_BOLD)
 
         # 2. 额度进度条
+        pad_line(1, 0, "")
+        pad_line(2, 0, "")
         if snap:
             bar_w = min(28, max(8, maxx - 52))
             def make_bar_txt(used, width):
@@ -2391,6 +2436,8 @@ class CodexTopDashboard:
                 pad_line(2, 0, f"Week Quota: [{' '*bar_w}] {w_used:.1f}% used | {w_rem:.1f}% left | Credits: {snap.credit_balance} (余额；未统计消费)")
                 safe_addstr(2, 13, wu_chars, c_pair(4) | curses.A_BOLD)
                 safe_addstr(2, 13 + len(wu_chars), wr_chars, curses.A_DIM)
+        else:
+            pad_line(1, 0, self.quota_notice(data), c_pair(2))
 
         pad_line(3, 0, self.control_status(data))
 
@@ -2412,18 +2459,13 @@ class CodexTopDashboard:
                 th_title = p["cmd"][:45]
                 turns_cnt = "-"
                 turn_st = "-"
-                matched_thread = None
-                for th in data.get("threads", []):
-                    if th["id"] in p["cmd"]:
-                        matched_thread = th
-                        break
-                if not matched_thread and data.get("threads"):
-                    root_threads = [th for th in data["threads"] if not th.get("is_subagent", False)]
-                    matched_thread = root_threads[0] if root_threads else data["threads"][0]
+                matched_thread = self.match_process_thread(p, data.get("threads", []))
+                if not matched_thread:
+                    th_title += " (会话未关联)"
 
                 if matched_thread:
                     th_title = matched_thread["title"]
-                    turns_cnt = str(matched_thread["turns_count"])
+                    turns_cnt = str(matched_thread["turns_count"]) if matched_thread["turns_count"] is not None else "-"
                     if matched_thread.get("is_capacity_error"):
                         turn_st = "at capacity"
                     else:
@@ -2461,7 +2503,7 @@ class CodexTopDashboard:
                 t_idx = len(turns)
                 t_st = last_turn.get("status", "inProgress")
 
-                div_title = f"─── Live Turn Execution Stream (Turn #{t_idx} ─ {t_st}, {len(items)} actions) "
+                div_title = f"─── Live Turn Execution Stream: {target_th['title']} (Turn #{t_idx} ─ {t_st}, {len(items)} actions) "
                 div_full = div_title + "─" * max(0, maxx - len(div_title) - 1)
                 pad_line(cur_row, 0, div_full, curses.A_DIM)
                 cur_row += 1
@@ -2485,7 +2527,7 @@ class CodexTopDashboard:
                             safe_addstr(cur_row, min(maxx - len(dur) - 2, 8 + len(c_st) + len(cmd_txt) + 3), dur, curses.A_DIM)
                     elif itype == "reasoning":
                         safe_addstr(cur_row, 2, "• [REASONING] ", c_pair(4) | curses.A_BOLD)
-                        safe_addstr(cur_row, 16, f"Deep model reasoning & kernel latency analysis... ({target_th['title'][:25]})", curses.A_DIM)
+                        safe_addstr(cur_row, 16, self.reasoning_summary(it)[:max(1, maxx-17)], curses.A_DIM)
                     elif itype == "webSearch":
                         safe_addstr(cur_row, 2, "• [SEARCH] ", c_pair(2) | curses.A_BOLD)
                         safe_addstr(cur_row, 13, it.get("query", "")[:max(10, maxx-16)])
@@ -2592,7 +2634,8 @@ class CodexTopDashboard:
                     needs_redraw = True
                 elif ch in (ord('r'), ord('R')):
                     self.set_flash("正在刷新数据...")
-                    self.check_and_reload()
+                    if self.check_and_reload():
+                        break
                     self.trigger_background_refresh()
                     needs_redraw = True
                 elif ch in (ord('+'), ord('=')):
@@ -2677,7 +2720,8 @@ class CodexTopDashboard:
                             last_refresh = 0.0
                         elif ch in ('r', 'R'):
                             self.set_flash("正在刷新数据...")
-                            self.check_and_reload()
+                            if self.check_and_reload():
+                                break
                             self.trigger_background_refresh()
                             last_refresh = 0.0
                         elif ch in ('+', '='):
@@ -2742,6 +2786,7 @@ def cmd_top(args):
     if curses is not None and sys.stdout.isatty():
         try:
             curses.wrapper(dashboard.run_curses)
+            dashboard.reload_if_requested()
             return
         except KeyboardInterrupt:
             return
@@ -2751,6 +2796,7 @@ def cmd_top(args):
 
     # 3. ANSI 持久实时刷新循环（保底确保一直动态刷新，按 q 退出）
     dashboard.run_ansi_loop()
+    dashboard.reload_if_requested()
 
 
 def threshold_arg(value):
@@ -2859,9 +2905,10 @@ def main():
     p_service.add_argument("--no-auto-continue", dest="auto_continue", action="store_false", help="禁用回合空闲时自动发送「继续」")
     p_service.add_argument("--idle-delay", type=nonnegative_int, default=5, help="检测到空闲后等待的缓冲秒数 (默认: 5s)")
 
+    known_cmds = ["top", "status", "sessions", "watch", "pause", "stop", "kill", "off", "disable", "fix-mouse", "resume", "run", "service", "-h", "--help"]
     prog_name = os.path.basename(sys.argv[0]).lower()
     if prog_name in ("codex-top", "top"):
-        if len(sys.argv) == 1 or sys.argv[1] not in ("top", "-h", "--help"):
+        if len(sys.argv) == 1 or sys.argv[1] not in known_cmds:
             sys.argv.insert(1, "top")
     elif prog_name in ("codex-stop", "stop", "codex-kill", "kill"):
         if len(sys.argv) == 1 or sys.argv[1] not in ("stop", "kill", "off", "disable", "-h", "--help"):
@@ -2875,7 +2922,6 @@ def main():
         cmd_status(None)
         return
 
-    known_cmds = ["top", "status", "sessions", "watch", "pause", "stop", "kill", "off", "disable", "fix-mouse", "resume", "run", "service", "-h", "--help"]
     if sys.argv[1] not in known_cmds:
         args, unknown = parser.parse_known_args(["run"] + sys.argv[1:])
         cmd_run(args, unknown)
