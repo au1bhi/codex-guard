@@ -8,7 +8,15 @@ Linux 上的 Codex 额度守护：额度不足时暂停，额度恢复后自动�
 bash scripts/install.sh
 ```
 
-安装后守护自动开启，并随用户登录启动。更新会移除旧命令别名，只保留以下三个日常命令。
+安装脚本安装命令和后台服务，不主动启动守护，并禁用登录自启；更新时已运行的守护不会因此停止。更新会移除旧命令别名，只保留以下三个日常命令。
+
+安装后运行 `codexguard-start`，或在 `codex-top` 内按 `g` 开启守护。需要登录自启时执行：
+
+```bash
+"$HOME/.local/lib/codex-guard/codex-guard" service enable
+```
+
+此命令会同时启动守护并启用登录自启。
 
 ## 使用
 
