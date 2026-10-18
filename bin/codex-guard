@@ -1404,27 +1404,49 @@ def cmd_sessions(args):
     print(f"{bold}{cyan}============================================================{reset}\n")
 
 
-def cmd_pause(args):
-    """手动暂停所有运行中的 Codex 客户端进程与后台推理任务"""
-    # Request interruption of active App-Server turns.
+def pause_manual_clients(reason):
+    """Record ownership before signaling, then retain only successful pauses."""
+    previous = read_snapshot()
+    clients = ProcessManager.get_codex_client_pids()
+    active = [pid for pid, state, _ in clients if state not in ("T", "t")]
+    identities = previous.get("process_identities", {})
+    retained = []
+    if previous.get("reason") not in {"quota_recovered", "manual_resumed"}:
+        retained = [pid for pid, state, _ in clients
+                    if state in ("T", "t") and pid in previous.get("active_pids", [])
+                    and identities.get(str(pid))
+                    and ProcessManager.process_identity(pid) == identities[str(pid)]]
+    saved = SessionManager.save_snapshot(retained + active, reason=reason)
+    paused, failed = [], []
+    for pid in active:
+        expected = saved["process_identities"].get(str(pid))
+        if expected and ProcessManager.suspend_pid(pid, expected=expected):
+            paused.append(pid)
+        else:
+            failed.append(pid)
+    # Save signal outcomes before slow RPCs. A concurrent newer intent wins.
+    owned = retained + paused
+    updated = dict(saved, active_pids=owned,
+                   process_identities={str(pid): saved["process_identities"][str(pid)] for pid in owned})
+    if not write_snapshot(updated, expected_snapshot=saved):
+        raise RuntimeError("任务状态已有更新，已保留最新记录；请检查暂停状态。")
     interrupted = SessionManager.interrupt_active_turns()
-    SessionManager.kill_orphaned_tool_subprocesses()
+    if interrupted:
+        SessionManager.kill_orphaned_tool_subprocesses()
+    completed = dict(updated, interrupted_turns=interrupted)
+    if not write_snapshot(completed, expected_snapshot=updated):
+        raise RuntimeError("任务状态已有更新，已保留最新记录；请检查暂停状态。")
+    message = f"已暂停 {len(paused)} 个客户端，中断 {len(interrupted)} 个回合。"
+    if failed:
+        raise RuntimeError(message + " 未能暂停的客户端：" + ", ".join(str(pid) for pid in failed))
+    return message
 
-    # 2. 暂停所有前端 CLI 进程
-    pids = ProcessManager.get_codex_client_pids()
-    active_pids = [p for p, st, _ in pids if st != "T"]
 
-    # 3. 保存快照
-    SessionManager.save_snapshot(active_pids, reason="manual_pause", interrupted_turns=interrupted)
-
-    for pid in active_pids:
-        if ProcessManager.suspend_pid(pid):
-            print(f"已发送 SIGSTOP 暂停 PID: {pid}")
-
-    cnt_turns = len(interrupted)
-    cnt_pids = len(active_pids)
-    print(f"已成功暂停: {cnt_turns} 个后台运行中任务已掐断 (服务器已确认中断请求)，{cnt_pids} 个客户端已挂起。")
-    send_notification("Codex 已手动暂停", f"已掐断 {cnt_turns} 个运行中任务，挂起 {cnt_pids} 个客户端，已确认的中断请求已发送；远端消耗不能保证立即停止。")
+def cmd_pause(args):
+    """手动暂停客户端，并如实报告信号失败。"""
+    message = pause_manual_clients("manual_pause")
+    print(message)
+    send_notification("Codex 已手动暂停", message + " 远端消耗不能保证立即停止。")
 
 
 def cmd_stop(args):
@@ -2034,16 +2056,7 @@ class CodexTopDashboard:
         return "自动继续已" + ("开启" if enabled else "关闭") + "；设置已保存，后台下一次检查生效。"
 
     def pause_clients(self):
-        clients = ProcessManager.get_codex_client_pids()
-        active = [pid for pid, state, _ in clients if state not in ("T", "t")]
-        saved = SessionManager.save_snapshot(active, reason="manual_top_pause")
-        paused = sum(ProcessManager.suspend_pid(pid, expected=saved["process_identities"].get(str(pid))) for pid in active)
-        interrupted = SessionManager.interrupt_active_turns()
-        if interrupted:
-            SessionManager.kill_orphaned_tool_subprocesses()
-        saved["interrupted_turns"] = interrupted
-        write_snapshot(saved)
-        return f"已暂停 {paused} 个客户端，中断 {len(interrupted)} 个回合。"
+        return pause_manual_clients("manual_top_pause")
 
     def resume_clients(self):
         saved = read_snapshot()

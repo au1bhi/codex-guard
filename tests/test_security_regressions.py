@@ -1274,5 +1274,140 @@ class DashboardControlTests(IsolatedTest):
             "service_active": False, "auto_continue_enabled": True}))
 
 
+class ManualPauseResultsTests(IsolatedTest):
+    def exercise(self, clients, outcomes, previous=None, dashboard=False, race=False):
+        if previous is not None:
+            cg.write_snapshot(previous)
+        def identity(pid):
+            return {"pid": pid, "starttime": pid}
+        def signal_result(pid, expected=None):
+            self.assertEqual(expected, identity(pid))
+            if race:
+                cg.write_snapshot({"reason": "manual_stopped", "active_pids": []})
+            return outcomes[pid]
+        output = io.StringIO()
+        with patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=clients), \
+             patch.object(cg.ProcessManager, "process_identity", side_effect=identity), \
+             patch.object(cg.ProcessManager, "suspend_pid", side_effect=signal_result) as suspend, \
+             patch.object(cg.SessionManager, "get_loaded_thread_ids", return_value=[]), \
+             patch.object(cg.SessionManager, "interrupt_active_turns", return_value=[]), \
+             patch.object(cg.SessionManager, "kill_orphaned_tool_subprocesses"), \
+             patch.object(cg, "send_notification") as notify, patch("sys.stdout", output):
+            error = None
+            try:
+                message = cg.CodexTopDashboard().pause_clients() if dashboard else cg.cmd_pause(None)
+            except RuntimeError as exc:
+                error = str(exc)
+                message = None
+        return cg.read_snapshot(), error, output.getvalue(), notify, suspend, message
+
+    def test_partial_failure_records_only_success_and_no_success_notification(self):
+        saved, error, output, notify, suspend, _ = self.exercise(
+            [(55555, "S", "codex"), (55556, "S", "codex")], {55555: True, 55556: False})
+        self.assertEqual(saved["active_pids"], [55555])
+        self.assertEqual(set(saved["process_identities"]), {"55555"})
+        self.assertIn("已暂停 1 个客户端", error)
+        self.assertIn("55556", error)
+        self.assertEqual(output, "")
+        notify.assert_not_called()
+
+    def test_dashboard_all_failed_keeps_no_false_ownership(self):
+        saved, error, _, notify, _, _ = self.exercise([(55555, "S", "codex")], {55555: False}, dashboard=True)
+        self.assertEqual(saved["active_pids"], [])
+        self.assertEqual(saved["process_identities"], {})
+        self.assertEqual(saved["reason"], "manual_top_pause")
+        self.assertIn("未能暂停", error)
+        notify.assert_not_called()
+
+    def test_success_reports_actual_count(self):
+        saved, error, output, notify, _, _ = self.exercise([(55555, "S", "codex")], {55555: True})
+        self.assertIsNone(error)
+        self.assertIn("已暂停 1 个客户端", output)
+        self.assertEqual(saved["active_pids"], [55555])
+        notify.assert_called_once()
+
+    def test_repeated_pause_preserves_owned_stopped_but_not_unowned(self):
+        old = {"reason": "manual_pause", "active_pids": [55555],
+               "process_identities": {"55555": {"pid": 55555, "starttime": 55555}}}
+        saved, error, _, _, suspend, _ = self.exercise(
+            [(55555, "T", "codex"), (55556, "t", "codex"), (55557, "S", "codex")], {55557: True}, old)
+        self.assertIsNone(error)
+        self.assertEqual(saved["active_pids"], [55555, 55557])
+        suspend.assert_called_once()
+
+    def test_reused_pid_does_not_inherit_stopped_ownership(self):
+        old = {"reason": "manual_pause", "active_pids": [55555],
+               "process_identities": {"55555": {"pid": 55555, "starttime": 1}}}
+        saved, error, _, _, suspend, _ = self.exercise([(55555, "T", "codex")], {}, old)
+        self.assertIsNone(error)
+        self.assertEqual(saved["active_pids"], [])
+        suspend.assert_not_called()
+
+    def test_released_legacy_snapshot_does_not_adopt_user_pause(self):
+        for reason in ["quota_recovered", "manual_resumed"]:
+            with self.subTest(reason=reason):
+                old = {"reason": reason, "active_pids": [55555],
+                       "process_identities": {"55555": {"pid": 55555, "starttime": 55555}}}
+                saved, error, _, _, _, _ = self.exercise([(55555, "T", "codex")], {}, old)
+                self.assertIsNone(error)
+                self.assertEqual(saved["active_pids"], [])
+
+    def test_newer_stop_intent_is_not_overwritten(self):
+        saved, error, _, notify, _, _ = self.exercise([(55555, "S", "codex")], {55555: False}, race=True)
+        self.assertEqual(saved["reason"], "manual_stopped")
+        self.assertIn("已有更新", error)
+        notify.assert_not_called()
+
+    def test_real_child_pause_failure_then_stop_releases_only_success(self):
+        children = [subprocess.Popen(["bash", "-c", "exec -a codex sleep 30"]) for _ in range(2)]
+        def cleanup():
+            for child in children:
+                if child.poll() is None:
+                    os.kill(child.pid, signal.SIGCONT)
+                    child.kill()
+                child.wait(timeout=3)
+        self.addCleanup(cleanup)
+        first, second = [child.pid for child in children]
+        for _ in range(100):
+            if all(cg.ProcessManager.is_codex_client(Path('/proc/%s/cmdline' % child.pid).read_bytes().decode().split('\0')[:-1]) for child in children):
+                break
+            time.sleep(.01)
+        else:
+            self.fail("Disposable codex children did not start")
+        suspend = cg.ProcessManager.suspend_pid
+        with patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[(first, "S", "codex"), (second, "S", "codex")]), \
+             patch.object(cg.ProcessManager, "suspend_pid", side_effect=lambda pid, expected=None: suspend(pid, expected) if pid == first else False), \
+             patch.object(cg.SessionManager, "get_loaded_thread_ids", return_value=[]), \
+             patch.object(cg.SessionManager, "interrupt_active_turns", return_value=[]):
+            with self.assertRaisesRegex(RuntimeError, str(second)):
+                cg.pause_manual_clients("manual_pause")
+        self.assertEqual(cg.read_snapshot()["active_pids"], [first])
+        for _ in range(100):
+            if cg.ProcessManager.read_stat(first)[0] in ("T", "t"):
+                break
+            time.sleep(.01)
+        self.assertIn(cg.ProcessManager.read_stat(first)[0], ("T", "t"))
+        self.assertNotIn(cg.ProcessManager.read_stat(second)[0], ("T", "t"))
+        with patch("subprocess.run"), patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[(first, "T", "codex"), (second, "S", "codex")]):
+            cg.cmd_guard_stop(quiet=True)
+        self.assertEqual(cg.read_snapshot()["active_pids"], [])
+        for _ in range(100):
+            if cg.ProcessManager.read_stat(first)[0] not in ("T", "t"):
+                break
+            time.sleep(.01)
+        self.assertNotIn(cg.ProcessManager.read_stat(first)[0], ("T", "t"))
+
+    def test_snapshot_failure_does_not_signal_or_interrupt(self):
+        with patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[(55555, "S", "codex")]), \
+             patch.object(cg.SessionManager, "get_loaded_thread_ids", return_value=[]), \
+             patch.object(cg, "write_snapshot", side_effect=OSError("disk full")), \
+             patch.object(cg.ProcessManager, "suspend_pid") as suspend, \
+             patch.object(cg.SessionManager, "interrupt_active_turns") as interrupt:
+            with self.assertRaisesRegex(RuntimeError, "保存会话快照失败"):
+                cg.pause_manual_clients("manual_pause")
+        suspend.assert_not_called()
+        interrupt.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
