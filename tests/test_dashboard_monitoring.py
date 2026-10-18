@@ -233,4 +233,70 @@ class Regression(unittest.TestCase):
             m['cmd_top'](SimpleNamespace(batch=True, delay=1, continue_prompt='continue'))
         self.assertEqual(previous, {sig: signal.getsignal(sig) for sig in previous})
 
+
+    def test_signal_during_ansi_screen_entry_still_cleans_up(self):
+        import textwrap
+        code = textwrap.dedent(r"""
+            import runpy, sys, time
+            from types import SimpleNamespace
+            m = runpy.run_path(SOURCE, run_name='startup_signal_fixture')
+            g = m['cmd_top'].__globals__
+            g['curses'] = None
+            g['CodexTopDashboard'].collect_data = lambda self: FIXTURE
+            class DelayedStdout:
+                def __init__(self, original):
+                    self.original = original
+                    self.pending = False
+                def __getattr__(self, name):
+                    return getattr(self.original, name)
+                def write(self, text):
+                    if '\x1b[?1049h' in text:
+                        self.pending = True
+                    return self.original.write(text)
+                def flush(self):
+                    self.original.flush()
+                    if self.pending:
+                        self.pending = False
+                        self.original.write('INIT-PAUSE\n')
+                        self.original.flush()
+                        time.sleep(30)
+            sys.stdout = DelayedStdout(sys.stdout)
+            m['cmd_top'](SimpleNamespace(batch=False, delay=.5, continue_prompt='continue'))
+        """).replace('SOURCE', repr(SOURCE)).replace('FIXTURE', repr(data()))
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(signal=signum), tempfile.TemporaryDirectory() as directory:
+                master, slave = pty.openpty()
+                before = termios.tcgetattr(slave)
+                output = bytearray()
+                child = subprocess.Popen([sys.executable, '-u', '-c', code], stdin=slave,
+                    stdout=slave, stderr=slave, env=dict(os.environ, CODEX_HOME=directory), start_new_session=True)
+                try:
+                    end = time.monotonic() + 5
+                    while time.monotonic() < end:
+                        if select.select([master], [], [], .05)[0]:
+                            output.extend(os.read(master, 65536))
+                        if b'INIT-PAUSE' in output:
+                            break
+                    else:
+                        self.fail('Startup pause not reached: ' + output.decode(errors='replace'))
+                    child.send_signal(signum)
+                    child.wait(timeout=4)
+                    while select.select([master], [], [], .05)[0]:
+                        chunk = os.read(master, 65536)
+                        if not chunk:
+                            break
+                        output.extend(chunk)
+                    self.assertEqual(child.returncode, 128 + signum)
+                    self.assertEqual(termios.tcgetattr(slave), before)
+                    self.assertEqual(output.count(b'\x1b[?1049h'), output.count(b'\x1b[?1049l'))
+                    self.assertIn(b'\x1b[?25h', output)
+                    self.assertNotIn(b'Traceback (most recent call last)', output)
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                        child.wait(timeout=3)
+                    termios.tcsetattr(slave, termios.TCSANOW, before)
+                    os.close(master)
+                    os.close(slave)
+
 if __name__=='__main__':unittest.main(verbosity=2)

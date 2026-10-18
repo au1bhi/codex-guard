@@ -2793,8 +2793,6 @@ class CodexTopDashboard:
         self._worker_thread = threading.Thread(target=self._background_collector, daemon=True)
         self._worker_thread.start()
 
-        sys.stdout.write("\033[?25l\033[?1049h\033[?1000l\033[?1001l\033[?1002l\033[?1003l\033[?1004l\033[?1005l\033[?1006l\033[?1015l")  # 隐藏光标，关闭鼠标追踪
-        sys.stdout.flush()
         old_settings = None
         resized = [False]
 
@@ -2803,11 +2801,12 @@ class CodexTopDashboard:
 
         old_handler = None
         try:
-            old_handler = signal.signal(signal.SIGWINCH, on_sigwinch)
-        except Exception:
-            pass
-
-        try:
+            try:
+                old_handler = signal.signal(signal.SIGWINCH, on_sigwinch)
+            except Exception:
+                pass
+            sys.stdout.write("\033[?25l\033[?1049h\033[?1000l\033[?1001l\033[?1002l\033[?1003l\033[?1004l\033[?1005l\033[?1006l\033[?1015l")  # 隐藏光标，关闭鼠标追踪
+            sys.stdout.flush()
             import select
             try:
                 import termios
