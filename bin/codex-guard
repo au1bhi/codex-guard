@@ -1761,19 +1761,29 @@ def run_watch_loop(
             if previous.get("reason") in auto_reasons:
                 identities = previous.get("process_identities", {})
                 resumed = []
+                pending = []
                 failed = False
                 clients = {pid: state for pid, state, _ in ProcessManager.get_codex_client_pids()}
                 for pid in previous.get("active_pids", []):
                     expected = identities.get(str(pid))
                     # Do not adopt arbitrary stopped clients or unverified legacy PIDs.
                     if expected and clients.get(pid) in ("T", "t") and ProcessManager.process_identity(pid) == expected:
-                        if read_snapshot().get("reason") not in auto_reasons:
+                        if read_snapshot() != previous:
                             failed = True
                             break
                         if ProcessManager.resume_pid(pid, expected=expected):
                             resumed.append(pid)
                         else:
+                            pending.append(pid)
                             failed = True
+                # Release successful/stale ownership before waiting or restoring sessions.
+                # Session failures must not authorize a later resume of a user pause.
+                updated = dict(previous, active_pids=pending,
+                               process_identities={str(pid): identities[str(pid)] for pid in pending})
+                if not write_snapshot(updated, automatic=True, expected_snapshot=previous):
+                    time.sleep(interval)
+                    continue
+                previous = updated
                 if resumed:
                     time.sleep(1)
                 running = [pid for pid, state, _ in ProcessManager.get_codex_client_pids() if state not in ("T", "t")]

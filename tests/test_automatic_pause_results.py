@@ -75,5 +75,91 @@ class AutomaticPauseResultsTests(IsolatedTest):
         self.assertTrue(any(c.args[0] == 'Codex 暂停未完成' for c in notify.call_args_list))
 
 
+class AutomaticRecoveryResultsTests(IsolatedTest):
+    def run_recovery(self, outcomes, sessions=False, second_poll=False, stop_during_resume=False,
+                     already_running=False, interrupt_after_signal=False):
+        pids = [55555, 55556] if second_poll or len(outcomes) > 1 else [55555]
+        identities = {str(pid): {'pid': pid, 'start_time': 1} for pid in pids}
+        cg.write_snapshot({'reason': 'quota_exceeded', 'active_pids': pids,
+                           'process_identities': identities,
+                           'sessions': [{'id': 'saved-task'}] if sessions else []})
+        states = {pid: 'S' if already_running else 'T' for pid in pids}
+        results = iter(outcomes)
+        def resume_signal(pid, expected=None):
+            self.assertEqual(expected, identities[str(pid)])
+            if stop_during_resume:
+                cg.write_snapshot({'reason': 'manual_top_pause', 'active_pids': []})
+            ok = next(results)
+            if ok:
+                states[pid] = 'S'
+            return ok
+        poll_count = [0]
+        def sleep(seconds):
+            if interrupt_after_signal and seconds == 1:
+                raise KeyboardInterrupt
+            if seconds == 7:
+                poll_count[0] += 1
+                if second_poll and poll_count[0] == 1:
+                    # The first client was successfully released, then paused by its user.
+                    states[55555] = 'T'
+                else:
+                    raise KeyboardInterrupt
+        with patch.object(cg.CodexSocketClient, 'query_rate_limits', return_value=healthy()), \
+             patch.object(cg.ProcessManager, 'get_codex_client_pids', side_effect=lambda: [(pid, state, 'codex') for pid, state in states.items()]), \
+             patch.object(cg.ProcessManager, 'process_identity', side_effect=lambda pid: identities[str(pid)]), \
+             patch.object(cg.ProcessManager, 'resume_pid', side_effect=resume_signal) as resume, \
+             patch.object(cg.SessionManager, 'get_loaded_thread_ids', return_value=[]), \
+             patch.object(cg.SessionManager, 'get_root_thread_id', side_effect=lambda tid: tid), \
+             patch.object(cg.SessionManager, 'is_subagent', return_value=False), \
+             patch.object(cg.SessionManager, 'launch_codex_session', return_value=False) as launch, \
+             patch.object(cg.SessionManager, 'restore_and_verify_sessions', return_value={'sessions': []}) as restore, \
+             patch.object(cg, 'send_notification') as notify, patch('time.sleep', side_effect=sleep):
+            cg.run_watch_loop(interval=7, auto_continue=False)
+        return cg.read_snapshot(), resume, launch, restore, notify
+
+    def test_partial_resume_retires_success_before_waiting(self):
+        saved, resume, _, _, _ = self.run_recovery([True, False], interrupt_after_signal=True)
+        self.assertEqual(resume.call_count, 2)
+        self.assertEqual(saved['active_pids'], [55556])
+        self.assertEqual(set(saved['process_identities']), {'55556'})
+        self.assertEqual(saved['reason'], 'quota_exceeded')
+
+    def test_retry_does_not_resume_user_pause_of_released_client(self):
+        saved, resume, _, _, _ = self.run_recovery([True, False, True, True], second_poll=True)
+        self.assertEqual([c.args[0] for c in resume.call_args_list], [55555, 55556, 55556])
+        self.assertEqual(saved['active_pids'], [])
+        self.assertEqual(saved['reason'], 'quota_recovered')
+
+    def test_failed_session_launch_does_not_retain_successful_process_ownership(self):
+        saved, resume, launch, _, _ = self.run_recovery([True], sessions=True)
+        resume.assert_called_once()
+        launch.assert_called_once()
+        self.assertEqual(saved['active_pids'], [])
+        self.assertEqual(saved['process_identities'], {})
+        self.assertEqual(saved['reason'], 'quota_exceeded')
+        self.assertEqual(saved['sessions'], [{'id': 'saved-task'}])
+
+    def test_new_manual_pause_prevents_remaining_recovery_actions(self):
+        saved, _, launch, restore, notify = self.run_recovery([True], stop_during_resume=True)
+        self.assertEqual(saved['reason'], 'manual_top_pause')
+        launch.assert_not_called()
+        restore.assert_not_called()
+        self.assertFalse(any(c.args[0] == 'Codex 额度已恢复' for c in notify.call_args_list))
+
+    def test_running_client_ownership_is_retired_even_if_session_launch_fails(self):
+        saved, resume, _, _, _ = self.run_recovery([], sessions=True, already_running=True)
+        resume.assert_not_called()
+        self.assertEqual(saved['active_pids'], [])
+        self.assertEqual(saved['reason'], 'quota_exceeded')
+
+    def test_failed_resume_remains_pending(self):
+        saved, resume, _, _, notify = self.run_recovery([False])
+        resume.assert_called_once()
+        self.assertEqual(saved['active_pids'], [55555])
+        self.assertEqual(set(saved['process_identities']), {'55555'})
+        self.assertEqual(saved['reason'], 'quota_exceeded')
+        self.assertFalse(any(c.args[0] == 'Codex 额度已恢复' for c in notify.call_args_list))
+
+
 if __name__ == '__main__':
     unittest.main()
