@@ -1737,7 +1737,7 @@ def run_watch_loop(
                         if read_snapshot() != saved:
                             break
                         expected = saved["process_identities"].get(str(pid))
-                        if ProcessManager.suspend_pid(pid, expected=expected):
+                        if expected and ProcessManager.suspend_pid(pid, expected=expected):
                             paused.append(pid)
                             log(f"额度不足或不可用，已暂停 PID {pid}；未确认额度恢复前保持暂停。")
                         else:

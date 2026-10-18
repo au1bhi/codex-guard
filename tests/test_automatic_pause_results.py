@@ -6,12 +6,12 @@ from test_security_regressions import IsolatedTest, cg, healthy
 
 
 class AutomaticPauseResultsTests(IsolatedTest):
-    def run_guard(self, quotas, clients, outcomes, sleeps=None, previous=None):
+    def run_guard(self, quotas, clients, outcomes, sleeps=None, previous=None, identity_provider=None):
         if previous is not None:
             cg.write_snapshot(previous)
         with patch.object(cg.CodexSocketClient, 'query_rate_limits', side_effect=quotas), \
              patch.object(cg.ProcessManager, 'get_codex_client_pids', side_effect=clients), \
-             patch.object(cg.ProcessManager, 'process_identity', side_effect=lambda pid: {'pid': pid, 'start_time': 1}), \
+             patch.object(cg.ProcessManager, 'process_identity', side_effect=identity_provider or (lambda pid: {'pid': pid, 'start_time': 1})), \
              patch.object(cg.ProcessManager, 'suspend_pid', side_effect=outcomes) as suspend, \
              patch.object(cg.ProcessManager, 'resume_pid', return_value=True) as resume, \
              patch.object(cg.SessionManager, 'interrupt_active_turns', return_value=[]), \
@@ -73,6 +73,63 @@ class AutomaticPauseResultsTests(IsolatedTest):
         self.assertEqual(saved['active_pids'], [])
         self.assertEqual(saved['reason'], 'quota_unavailable')
         self.assertTrue(any(c.args[0] == 'Codex 暂停未完成' for c in notify.call_args_list))
+
+
+    def test_missing_recorded_identity_prevents_suspension(self):
+        saved, suspend, _, notify, _ = self.run_guard(
+            [healthy(99)], [[(55555, 'S', 'codex')]], [True],
+            identity_provider=lambda pid: None)
+        suspend.assert_not_called()
+        self.assertEqual(saved['active_pids'], [])
+        self.assertEqual(saved['process_identities'], {})
+        self.assertTrue(any(c.args[0] == 'Codex 暂停未完成' for c in notify.call_args_list))
+
+    def test_missing_identity_is_retried_when_next_snapshot_can_record_it(self):
+        identity = {'pid': 55555, 'start_time': 1}
+        saved, suspend, _, _, _ = self.run_guard(
+            [healthy(99), healthy(99)], [[(55555, 'S', 'codex')]] * 2,
+            [True, True], [None, KeyboardInterrupt], identity_provider=[None, identity])
+        suspend.assert_called_once_with(55555, expected=identity)
+        self.assertEqual(saved['active_pids'], [55555])
+        self.assertEqual(saved['process_identities'], {'55555': identity})
+
+
+    def test_real_child_is_not_paused_when_snapshot_identity_read_fails(self):
+        import os
+        import signal
+        import subprocess
+        import time
+        from pathlib import Path
+        child = subprocess.Popen(['bash', '-c', 'exec -a codex sleep 30'])
+        def cleanup():
+            if child.poll() is None:
+                os.kill(child.pid, signal.SIGCONT)
+                child.kill()
+            child.wait(timeout=3)
+        self.addCleanup(cleanup)
+        for _ in range(100):
+            parts = Path('/proc/%s/cmdline' % child.pid).read_bytes().decode().split('\0')[:-1]
+            if cg.ProcessManager.is_codex_client(parts):
+                break
+            time.sleep(.01)
+        else:
+            self.fail('Disposable codex child did not start')
+        original_identity = cg.ProcessManager.process_identity
+        reads = [0]
+        def flaky_identity(pid):
+            reads[0] += 1
+            return None if reads[0] == 1 else original_identity(pid)
+        with patch.object(cg.CodexSocketClient, 'query_rate_limits', return_value=healthy(99)), \
+             patch.object(cg.ProcessManager, 'get_codex_client_pids', return_value=[(child.pid, 'S', 'codex')]), \
+             patch.object(cg.ProcessManager, 'process_identity', side_effect=flaky_identity), \
+             patch.object(cg.ProcessManager, 'suspend_pid', wraps=cg.ProcessManager.suspend_pid) as suspend, \
+             patch.object(cg.SessionManager, 'get_loaded_thread_ids', return_value=[]), \
+             patch.object(cg.SessionManager, 'interrupt_active_turns', return_value=[]), \
+             patch.object(cg, 'send_notification'), patch('time.sleep', side_effect=KeyboardInterrupt):
+            cg.run_watch_loop(auto_continue=False)
+        suspend.assert_not_called()
+        self.assertNotIn(cg.ProcessManager.read_stat(child.pid)[0], ('T', 't'))
+        self.assertEqual(cg.read_snapshot()['active_pids'], [])
 
 
 class AutomaticRecoveryResultsTests(IsolatedTest):

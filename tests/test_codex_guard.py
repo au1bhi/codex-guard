@@ -365,6 +365,7 @@ class TestWatchLoopSimulation(unittest.TestCase):
              patch.object(cg.SessionManager, "interrupt_active_turns", return_value=[{"threadId": "t1", "turnId": "turn-1", "title": "Task 1"}]) as mock_interrupt, \
              patch.object(cg.SessionManager, "kill_orphaned_tool_subprocesses") as mock_kill_tools, \
              patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[(5555, "S", "codex")]), \
+             patch.object(cg.ProcessManager, "process_identity", return_value={"start_time": "fixture", "boot_id": "fixture"}), \
              patch.object(cg.ProcessManager, "suspend_pid", return_value=True) as mock_suspend, \
              patch.object(cg, "send_notification") as mock_notify, \
              patch("time.sleep", side_effect=KeyboardInterrupt):  # Stop loop after 1 iteration
@@ -376,7 +377,7 @@ class TestWatchLoopSimulation(unittest.TestCase):
 
             mock_interrupt.assert_called_once()
             mock_kill_tools.assert_called_once()
-            mock_suspend.assert_called_once_with(5555, expected=None)
+            mock_suspend.assert_called_once_with(5555, expected={"start_time": "fixture", "boot_id": "fixture"})
             self.assertTrue(os.path.exists(self.snap_file))
             with open(self.snap_file) as f:
                 snap = json.load(f)

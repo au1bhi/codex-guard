@@ -192,8 +192,11 @@ class ProcessAndStateTests(IsolatedTest):
 
 class WatchTests(IsolatedTest):
     def simulate(self, data, clients, **kwargs):
+        process_identity = cg.ProcessManager.process_identity
         with patch.object(cg.CodexSocketClient, "query_rate_limits", return_value=data), \
              patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=clients), \
+             patch.object(cg.ProcessManager, "process_identity", side_effect=lambda pid:
+                          process_identity(pid) or {"start_time": "fixture", "boot_id": "fixture"}), \
              patch.object(cg.ProcessManager, "suspend_pid", return_value=True) as suspend, \
              patch.object(cg.ProcessManager, "resume_pid", return_value=True) as resume, \
              patch.object(cg.SessionManager, "interrupt_active_turns", return_value=[]), \
@@ -219,7 +222,7 @@ class WatchTests(IsolatedTest):
 
     def test_unknown_quota_pauses_and_exit_does_not_unfreeze(self):
         suspend, resume, _ = self.simulate({"rateLimits": {}}, [(55555, "S", "codex")])
-        suspend.assert_called_once_with(55555, expected=None)
+        suspend.assert_called_once_with(55555, expected={"start_time": "fixture", "boot_id": "fixture"})
         resume.assert_not_called()
         self.assertEqual(cg.read_snapshot()["reason"], "quota_unavailable")
 
