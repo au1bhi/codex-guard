@@ -1732,11 +1732,29 @@ def run_watch_loop(
                         if not write_snapshot(saved, automatic=True):
                             time.sleep(interval)
                             continue
+                    paused, failed = [], []
                     for pid in active:
+                        if read_snapshot() != saved:
+                            break
                         expected = saved["process_identities"].get(str(pid))
                         if ProcessManager.suspend_pid(pid, expected=expected):
+                            paused.append(pid)
                             log(f"额度不足或不可用，已暂停 PID {pid}；未确认额度恢复前保持暂停。")
-                    send_notification("Codex 已暂停", "额度不足或不可用，等待有效的额度数据恢复。", urgency="critical")
+                        else:
+                            failed.append(pid)
+                    # Failed signals confer no ownership over a later user pause.
+                    owned = [pid for pid in saved["active_pids"] if pid not in active or pid in paused]
+                    updated = dict(saved, active_pids=owned,
+                                   process_identities={str(pid): saved["process_identities"][str(pid)]
+                                                       for pid in owned if str(pid) in saved["process_identities"]})
+                    if write_snapshot(updated, automatic=True, expected_snapshot=saved):
+                        if failed:
+                            log("自动暂停失败的客户端：" + ", ".join(str(pid) for pid in failed))
+                            send_notification("Codex 暂停未完成",
+                                              f"已暂停 {len(paused)} 个客户端；{len(failed)} 个未能暂停，将在下次检查重试。",
+                                              urgency="critical")
+                        else:
+                            send_notification("Codex 已暂停", "额度不足或不可用，等待有效的额度数据恢复。", urgency="critical")
                 time.sleep(interval)
                 continue
 
