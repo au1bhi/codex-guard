@@ -204,6 +204,19 @@ class WatchTests(IsolatedTest):
             cg.run_watch_loop(interval=1, auto_continue=False, **kwargs)
         return suspend, resume, launch
 
+    def test_explicit_start_restores_low_quota_protection_after_stop(self):
+        with patch("subprocess.run"), \
+             patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[]):
+            cg.cmd_guard_stop(quiet=True)
+            self.assertEqual(cg.read_snapshot()["reason"], "manual_stopped")
+            cg.cmd_guard_start(quiet=True)
+        self.assertEqual(cg.read_snapshot()["reason"], "guard_started")
+        suspend, resume, launch = self.simulate(healthy(99), [(55555, "S", "codex")])
+        suspend.assert_called_once()
+        resume.assert_not_called()
+        launch.assert_not_called()
+        self.assertEqual(cg.read_snapshot()["reason"], "quota_exceeded")
+
     def test_unknown_quota_pauses_and_exit_does_not_unfreeze(self):
         suspend, resume, _ = self.simulate({"rateLimits": {}}, [(55555, "S", "codex")])
         suspend.assert_called_once_with(55555, expected=None)
@@ -275,6 +288,66 @@ class WatchTests(IsolatedTest):
              patch.object(cg.SessionManager, "send_continue_prompt", return_value=True) as send, patch("time.sleep"):
             cg.SessionManager.restore_and_verify_sessions([])
         send.assert_called_once_with("saved", "继续")
+
+
+class GuardStartTests(IsolatedTest):
+    def test_successful_start_preserves_explicit_pause_and_recovery_state(self):
+        for reason in ["manual_pause", "manual_top_pause", "quota_exceeded"]:
+            previous = {"reason": reason, "sessions": [{"id": "saved"}]}
+            cg.write_snapshot(previous)
+            with patch("subprocess.run"):
+                cg.cmd_guard_start(quiet=True)
+            self.assertEqual(cg.read_snapshot(), previous)
+
+    def test_failed_start_preserves_stop(self):
+        previous = {"reason": "manual_stopped", "stopped_at": 1}
+        cg.write_snapshot(previous)
+        with patch("subprocess.run", side_effect=subprocess.CalledProcessError(1, "systemctl")):
+            with self.assertRaises(subprocess.CalledProcessError):
+                cg.cmd_guard_start(quiet=True)
+        self.assertEqual(cg.read_snapshot(), previous)
+
+    def test_concurrent_new_stop_or_pause_wins_over_start(self):
+        for reason in ["manual_stopped", "manual_pause", "manual_top_pause"]:
+            cg.write_snapshot({"reason": "manual_stopped", "stopped_at": 1})
+            latest = {"reason": reason, "stopped_at": 2}
+            with patch("subprocess.run", side_effect=lambda *a, **k: cg.write_snapshot(latest)):
+                cg.cmd_guard_start(quiet=True)
+            self.assertEqual(cg.read_snapshot(), latest)
+
+    def test_snapshot_compare_and_swap_rejects_changed_state(self):
+        previous = {"reason": "manual_stopped", "stopped_at": 1}
+        latest = dict(previous, stopped_at=2)
+        cg.write_snapshot(latest)
+        self.assertFalse(cg.write_snapshot({"reason": "guard_started"}, expected_snapshot=previous))
+        self.assertEqual(cg.read_snapshot(), latest)
+
+    def test_service_start_paths_clear_only_stale_stop(self):
+        for action in ["start", "enable", "restart", "install"]:
+            for reason in ["manual_stopped", "manual_top_pause"]:
+                with self.subTest(action=action, reason=reason):
+                    cg.write_snapshot({"reason": reason, "sessions": [{"id": "saved"}]})
+                    args = MagicMock(action=action, threshold=3, interval=10, idle_delay=5,
+                                     auto_continue=False, continue_prompt="continue")
+                    with patch("subprocess.run"), \
+                         patch.object(cg, "SERVICE_FILE", str(Path(self.tmp.name) / "guard.service")):
+                        cg.cmd_service(args)
+                    expected = "guard_started" if reason == "manual_stopped" else reason
+                    self.assertEqual(cg.read_snapshot()["reason"], expected)
+                    self.assertEqual(cg.read_snapshot()["sessions"], [{"id": "saved"}])
+
+    def test_failed_service_start_does_not_clear_stop(self):
+        for action in ["start", "enable", "restart", "install"]:
+            with self.subTest(action=action):
+                previous = {"reason": "manual_stopped", "stopped_at": 1}
+                cg.write_snapshot(previous)
+                args = MagicMock(action=action, threshold=3, interval=10, idle_delay=5,
+                                 auto_continue=False, continue_prompt="continue")
+                with patch("subprocess.run", side_effect=subprocess.CalledProcessError(1, "systemctl")), \
+                     patch.object(cg, "SERVICE_FILE", str(Path(self.tmp.name) / "guard.service")):
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        cg.cmd_service(args)
+                self.assertEqual(cg.read_snapshot(), previous)
 
 
 class WebSocketTests(IsolatedTest):

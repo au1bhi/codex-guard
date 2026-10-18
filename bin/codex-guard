@@ -92,7 +92,7 @@ def read_snapshot() -> Dict[str, Any]:
         return {}
 
 
-def write_snapshot(data: Dict[str, Any], automatic: bool = False) -> bool:
+def write_snapshot(data: Dict[str, Any], automatic: bool = False, expected_snapshot=None) -> bool:
     """Atomically replace private state; manual intent takes priority under a file lock."""
     directory = os.path.dirname(SNAPSHOT_FILE)
     os.makedirs(directory, mode=0o700, exist_ok=True)
@@ -100,7 +100,10 @@ def write_snapshot(data: Dict[str, Any], automatic: bool = False) -> bool:
     path = None
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        if automatic and read_snapshot().get("reason") in {"manual_pause", "manual_top_pause", "manual_stopped"}:
+        current = read_snapshot()
+        if expected_snapshot is not None and current != expected_snapshot:
+            return False
+        if automatic and current.get("reason") in {"manual_pause", "manual_top_pause", "manual_stopped"}:
             return False
         fd, path = tempfile.mkstemp(prefix=".quota-guard-", dir=directory)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -1507,9 +1510,18 @@ def cmd_stop(args):
     send_notification("codex-guard 已停止", "守护服务已完全退出，终端环境已恢复正常。")
 
 
+def clear_manual_stop(previous):
+    """An explicit successful start supersedes only the stop observed before it."""
+    if previous.get("reason") == "manual_stopped":
+        write_snapshot(dict(previous, reason="guard_started", started_at=time.time()),
+                       expected_snapshot=previous)
+
+
 def cmd_guard_start(quiet=False):
     """Start the installed background guard, idempotently."""
+    previous = read_snapshot()
     subprocess.run(["systemctl", "--user", "start", SERVICE_NAME], check=True, timeout=10)
+    clear_manual_stop(previous)
     if not quiet:
         print("守护已开启。")
 
@@ -1830,6 +1842,7 @@ def cmd_service(args):
     """管理 systemd 用户级守护服务"""
     action = args.action
     exec_path = os.path.realpath(__file__)
+    previous = read_snapshot()
 
     if action == "install":
         os.makedirs(os.path.dirname(SERVICE_FILE), exist_ok=True)
@@ -1893,6 +1906,9 @@ WantedBy=default.target
 
     elif action == "status":
         subprocess.run(["systemctl", "--user", "status", SERVICE_NAME])
+
+    if action in {"install", "start", "restart", "enable"}:
+        clear_manual_stop(previous)
 
 
 class TerminalKeyFilter:
