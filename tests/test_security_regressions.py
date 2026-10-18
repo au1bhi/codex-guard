@@ -357,6 +357,223 @@ class StopCleanupTests(IsolatedTest):
                            "process_identities": {"55555": identity}})
         return identity
 
+    def test_repeated_stop_does_not_reuse_released_pause_ownership(self):
+        identity = self.saved_clients()
+        with patch("subprocess.run"), \
+             patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[(55555, "T", "codex")]), \
+             patch.object(cg.ProcessManager, "resume_pid", return_value=True) as resume:
+            cg.cmd_guard_stop(quiet=True)
+            self.assertEqual(cg.read_snapshot()["active_pids"], [])
+            cg.cmd_guard_stop(quiet=True)
+        resume.assert_called_once_with(55555, expected=identity)
+        self.assertEqual(cg.read_snapshot()["process_identities"], {})
+
+    def test_running_client_retires_old_pause_record(self):
+        self.saved_clients()
+        with patch("subprocess.run"), \
+             patch.object(cg.ProcessManager, "get_codex_client_pids", side_effect=[
+                 [(55555, "S", "codex")], [(55555, "T", "codex")]]), \
+             patch.object(cg.ProcessManager, "resume_pid") as resume:
+            cg.cmd_guard_stop(quiet=True)
+            cg.cmd_guard_stop(quiet=True)
+        resume.assert_not_called()
+
+    def test_legacy_recovered_snapshot_does_not_adopt_new_pause(self):
+        for reason in ["quota_recovered", "manual_resumed"]:
+            self.saved_clients()
+            previous = cg.read_snapshot(); previous["reason"] = reason; cg.write_snapshot(previous)
+            with patch("subprocess.run"), \
+                 patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[(55555, "T", "codex")]), \
+                 patch.object(cg.ProcessManager, "resume_pid") as resume:
+                cg.cmd_guard_stop(quiet=True)
+            resume.assert_not_called(); self.assertEqual(cg.read_snapshot()["active_pids"], [])
+
+    def test_partial_resume_retains_only_failed_clients_for_retry(self):
+        identity = {"start_time": "100", "boot_id": "boot"}
+        cg.write_snapshot({"reason": "quota_exceeded", "active_pids": [55555, 55556],
+            "process_identities": {"55555": identity, "55556": identity}, "sessions": [{"id": "saved"}]})
+        clients = [(55555, "T", "codex"), (55556, "T", "codex")]
+        with patch("subprocess.run"), \
+             patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=clients), \
+             patch.object(cg.ProcessManager, "process_identity", return_value=identity), \
+             patch.object(cg.ProcessManager, "read_stat", return_value=["T"]), \
+             patch.object(cg.ProcessManager, "resume_pid", side_effect=[True, False]):
+            with self.assertRaisesRegex(RuntimeError, "55556"):
+                cg.cmd_guard_stop(quiet=True)
+        saved = cg.read_snapshot()
+        self.assertEqual(saved["active_pids"], [55556])
+        self.assertEqual(saved["process_identities"], {"55556": identity})
+        self.assertEqual(saved["sessions"], [{"id": "saved"}])
+        with patch("subprocess.run"), \
+             patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=clients), \
+             patch.object(cg.ProcessManager, "resume_pid", return_value=True) as resume:
+            cg.cmd_guard_stop(quiet=True)
+        resume.assert_called_once_with(55556, expected=identity)
+        self.assertEqual(cg.read_snapshot()["active_pids"], [])
+
+    def test_gone_reused_or_already_running_client_does_not_block_cleanup(self):
+        identity = {"start_time": "100", "boot_id": "boot"}
+        observations = [(None, "Z"), (dict(identity, start_time="reused"), "T"), (identity, "S")]
+        for observed, state in observations:
+            with self.subTest(observed=observed, state=state):
+                self.saved_clients()
+                with patch("subprocess.run"), \
+                     patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[(55555, "T", "codex")]), \
+                     patch.object(cg.ProcessManager, "resume_pid", return_value=False), \
+                     patch.object(cg.ProcessManager, "process_identity", return_value=observed), \
+                     patch.object(cg.ProcessManager, "read_stat", return_value=[state]):
+                    cg.cmd_guard_stop(quiet=True)
+                self.assertEqual(cg.read_snapshot()["active_pids"], [])
+
+    def test_new_snapshot_during_resume_is_not_cleared(self):
+        self.saved_clients()
+        latest = {"reason": "manual_top_pause", "active_pids": [55557]}
+        def resume(*args, **kwargs):
+            cg.write_snapshot(latest)
+            return True
+        with patch("subprocess.run"), \
+             patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[(55555, "T", "codex")]), \
+             patch.object(cg.ProcessManager, "resume_pid", side_effect=resume):
+            cg.cmd_guard_stop(quiet=True)
+        self.assertEqual(cg.read_snapshot(), latest)
+
+    def test_new_pause_during_stop_is_preserved(self):
+        self.saved_clients()
+        latest = {"reason": "manual_top_pause", "active_pids": [55557]}
+        with patch("subprocess.run", side_effect=lambda *a, **k: cg.write_snapshot(latest)), \
+             patch.object(cg.ProcessManager, "resume_pid") as resume:
+            cg.cmd_guard_stop(quiet=True)
+        resume.assert_not_called(); self.assertEqual(cg.read_snapshot(), latest)
+
+    def test_generic_stop_does_not_overwrite_new_pause(self):
+        self.saved_clients()
+        latest = {"reason": "manual_top_pause", "active_pids": [55557]}
+        args = MagicMock(keep_service=False, disable=False, subcommand="stop", kill_codex=False)
+        with patch("subprocess.run", side_effect=lambda *a, **k: cg.write_snapshot(latest)), \
+             patch("os.listdir", return_value=[]), patch.object(cg, "send_notification"), \
+             patch.object(cg.ProcessManager, "reset_all_terminal_mouse_tracking"), \
+             patch.object(cg.ProcessManager, "resume_pid") as resume:
+            cg.cmd_stop(args)
+        resume.assert_not_called(); self.assertEqual(cg.read_snapshot(), latest)
+
+    def test_failed_stop_rollback_does_not_overwrite_new_metadata(self):
+        self.saved_clients(); newer = {}
+        def fail(*args, **kwargs):
+            newer.update(cg.read_snapshot(), note="newer state")
+            cg.write_snapshot(newer)
+            raise subprocess.CalledProcessError(1, "systemctl")
+        with patch("subprocess.run", side_effect=fail):
+            with self.assertRaises(subprocess.CalledProcessError):
+                cg.cmd_guard_stop(quiet=True)
+        self.assertEqual(cg.read_snapshot(), newer)
+
+    def test_public_stop_reports_resume_failure_cleanly(self):
+        with patch.object(sys, "argv", ["codexguard-stop"]), \
+             patch.object(cg, "cmd_guard_stop", side_effect=RuntimeError("still paused")):
+            with self.assertRaisesRegex(SystemExit, "still paused"):
+                cg.main()
+
+    def manual_resume(self, dashboard):
+        if dashboard:
+            return cg.CodexTopDashboard().resume_clients()
+        return cg.cmd_resume(MagicMock(session_id=None, no_continue=True, continue_prompt="continue"))
+
+    def test_manual_resume_retires_released_records_before_later_stop(self):
+        for dashboard in [False, True]:
+            with self.subTest(dashboard=dashboard):
+                self.saved_clients()
+                with patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[(55555, "T", "codex")]), \
+                     patch.object(cg.ProcessManager, "resume_pid", return_value=True) as resume, \
+                     patch.object(cg.SessionManager, "restore_and_verify_sessions"), \
+                     patch.object(cg, "read_guard_service", return_value={"default_auto_continue": False}), \
+                     patch.object(cg, "send_notification"), patch("subprocess.run"):
+                    self.manual_resume(dashboard)
+                    self.assertEqual(cg.read_snapshot()["active_pids"], [])
+                    cg.cmd_guard_stop(quiet=True)
+                self.assertEqual(resume.call_count, 1)
+
+    def test_failed_manual_resume_keeps_pause_and_does_not_continue(self):
+        for dashboard in [False, True]:
+            with self.subTest(dashboard=dashboard):
+                identity = self.saved_clients()
+                with patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[(55555, "t", "codex")]), \
+                     patch.object(cg.ProcessManager, "resume_pid", return_value=False), \
+                     patch.object(cg.SessionManager, "restore_and_verify_sessions") as restore, \
+                     patch.object(cg, "send_notification") as notify:
+                    with self.assertRaisesRegex(RuntimeError, "55555"):
+                        self.manual_resume(dashboard)
+                restore.assert_not_called(); notify.assert_not_called()
+                self.assertEqual(cg.read_snapshot()["active_pids"], [55555])
+                self.assertEqual(cg.read_snapshot()["reason"], "quota_exceeded")
+                self.assertEqual(cg.read_snapshot()["process_identities"], {"55555": identity})
+
+    def test_partial_manual_resume_retires_successes_without_continuing(self):
+        identity = {"start_time": "100", "boot_id": "boot"}
+        for dashboard in [False, True]:
+            cg.write_snapshot({"reason": "manual_top_pause", "active_pids": [55555, 55556],
+                "process_identities": {"55555": identity, "55556": identity}})
+            with patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[
+                    (55555, "T", "codex"), (55556, "T", "codex")]), \
+                 patch.object(cg.ProcessManager, "resume_pid", side_effect=[True, False]), \
+                 patch.object(cg.SessionManager, "restore_and_verify_sessions") as restore:
+                with self.assertRaisesRegex(RuntimeError, "55556"):
+                    self.manual_resume(dashboard)
+            restore.assert_not_called()
+            self.assertEqual(cg.read_snapshot()["active_pids"], [55556])
+            self.assertEqual(cg.read_snapshot()["reason"], "manual_top_pause")
+
+    def test_failed_explicit_resume_of_legacy_record_retains_retry_ownership(self):
+        self.saved_clients()
+        previous = cg.read_snapshot(); previous["reason"] = "manual_resumed"; cg.write_snapshot(previous)
+        with patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[(55555, "T", "codex")]), \
+             patch.object(cg.ProcessManager, "resume_pid", return_value=False), \
+             patch.object(cg.SessionManager, "restore_and_verify_sessions") as restore:
+            with self.assertRaises(RuntimeError):
+                self.manual_resume(False)
+        restore.assert_not_called()
+        self.assertEqual(cg.read_snapshot()["reason"], "manual_pause")
+        self.assertEqual(cg.read_snapshot()["active_pids"], [55555])
+
+    def test_new_manual_pause_during_resume_is_preserved_without_continue(self):
+        for dashboard in [False, True]:
+            self.saved_clients()
+            latest = {"reason": "manual_top_pause", "active_pids": [55557]}
+            def resume(*args, **kwargs):
+                cg.write_snapshot(latest)
+                return True
+            with patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[(55555, "T", "codex")]), \
+                 patch.object(cg.ProcessManager, "resume_pid", side_effect=resume), \
+                 patch.object(cg.SessionManager, "restore_and_verify_sessions") as restore:
+                with self.assertRaisesRegex(RuntimeError, "最新记录"):
+                    self.manual_resume(dashboard)
+            restore.assert_not_called(); self.assertEqual(cg.read_snapshot(), latest)
+
+    def test_no_stopped_clients_retires_stale_cli_record(self):
+        self.saved_clients()
+        with patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[(55555, "S", "codex")]), \
+             patch.object(cg.SessionManager, "restore_and_verify_sessions") as restore:
+            self.manual_resume(False)
+        restore.assert_not_called(); self.assertEqual(cg.read_snapshot()["active_pids"], [])
+
+    def test_automatic_recovery_retires_owned_pause_before_later_stop(self):
+        identity = self.saved_clients()
+        cg.set_auto_continue(False)
+        def sleep(seconds):
+            if seconds == 7:
+                raise KeyboardInterrupt
+        with patch.object(cg.CodexSocketClient, "query_rate_limits", return_value=healthy()), \
+             patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[(55555, "T", "codex")]), \
+             patch.object(cg.ProcessManager, "process_identity", return_value=identity), \
+             patch.object(cg.ProcessManager, "resume_pid", return_value=True) as resume, \
+             patch.object(cg.SessionManager, "get_loaded_thread_ids", return_value=[]), \
+             patch.object(cg.SessionManager, "restore_and_verify_sessions", return_value={"sessions": []}), \
+             patch.object(cg, "send_notification"), patch("time.sleep", side_effect=sleep), patch("subprocess.run"):
+            cg.run_watch_loop(interval=7, auto_continue=False)
+            self.assertEqual(cg.read_snapshot()["reason"], "quota_recovered")
+            self.assertEqual(cg.read_snapshot()["active_pids"], [])
+            cg.cmd_guard_stop(quiet=True)
+        resume.assert_called_once_with(55555, expected=identity)
+
     def test_service_stop_modes_release_only_recorded_verified_clients(self):
         for action in ["stop", "disable", "uninstall"]:
             with self.subTest(action=action):
@@ -461,6 +678,54 @@ class StopCleanupTests(IsolatedTest):
         self.assertTrue((home / ".local/lib/codex-guard/codex-guard").exists())
         self.assertTrue((home / ".config/systemd/user/codex-quota-guard.service").exists())
         self.assertEqual(json.loads(snapshot.read_text()), previous)
+
+    def test_uninstall_refused_resume_preserves_program_and_can_retry(self):
+        home, env = self.install_fixture()
+        proc = subprocess.Popen(["bash", "-c", "exec -a codex sleep 30"])
+        def cleanup():
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGCONT); proc.terminate()
+            proc.wait(timeout=3)
+        self.addCleanup(cleanup)
+        deadline = time.monotonic() + 3
+        while Path(f"/proc/{proc.pid}/cmdline").read_bytes().split(b"\0")[0] != b"codex":
+            self.assertLess(time.monotonic(), deadline); time.sleep(.01)
+        proc.send_signal(signal.SIGSTOP)
+        while cg.ProcessManager.read_stat(proc.pid)[0] != "T":
+            self.assertLess(time.monotonic(), deadline); time.sleep(.01)
+        identity = cg.ProcessManager.process_identity(proc.pid)
+        snapshot = home / ".codex/quota_guard_snapshot.json"
+        snapshot.write_text(json.dumps({"reason": "quota_exceeded", "active_pids": [proc.pid],
+            "process_identities": {str(proc.pid): identity}}))
+        injections = Path(self.tmp.name) / "injections"; injections.mkdir()
+        (injections / "sitecustomize.py").write_text('''import os, signal
+original_kill = os.kill
+def kill(pid, sig):
+    if sig == signal.SIGCONT:
+        raise PermissionError("simulated signal refusal")
+    return original_kill(pid, sig)
+os.kill = kill
+if hasattr(signal, "pidfd_send_signal"):
+    original_send = signal.pidfd_send_signal
+    def send(fd, sig, siginfo=None, flags=0):
+        if sig == signal.SIGCONT:
+            raise PermissionError("simulated signal refusal")
+        return original_send(fd, sig, siginfo, flags)
+    signal.pidfd_send_signal = send
+''')
+        refused_env = dict(env, PYTHONPATH=str(injections))
+        result = subprocess.run(["bash", str(ROOT / "scripts/uninstall.sh")], env=refused_env, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("暂停".encode(), result.stderr)
+        self.assertNotIn(b"Traceback", result.stderr)
+        self.assertEqual(cg.ProcessManager.read_stat(proc.pid)[0], "T")
+        self.assertTrue((home / ".local/lib/codex-guard/codex-guard").exists())
+        self.assertTrue((home / ".config/systemd/user/codex-quota-guard.service").exists())
+        self.assertEqual(json.loads(snapshot.read_text())["active_pids"], [proc.pid])
+        subprocess.run(["bash", str(ROOT / "scripts/uninstall.sh")], env=env, capture_output=True, check=True)
+        self.assertNotEqual(cg.ProcessManager.read_stat(proc.pid)[0], "T")
+        self.assertEqual(json.loads(snapshot.read_text())["active_pids"], [])
+        self.assertFalse((home / ".local/lib/codex-guard/codex-guard").exists())
 
 
 class WebSocketTests(IsolatedTest):

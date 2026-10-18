@@ -1488,8 +1488,9 @@ def cmd_stop(args):
             except Exception:
                 pass
 
-    # 5. 更新快照状态
-    if not keep_service or kill_codex:
+    # Ordinary stop already records intent in cmd_guard_stop; do not overwrite
+    # a newer pause after it returns. Explicit client termination still records it.
+    if kill_codex:
         try:
             snap_data = read_snapshot()
             snap_data["reason"] = "manual_stopped"
@@ -1533,24 +1534,42 @@ def cmd_guard_stop(quiet=False):
     """Stop protection and release only clients paused by this guard."""
     previous = read_snapshot()
     saved = dict(previous, reason="manual_stopped", stopped_at=time.time())
+    if previous.get("reason") in {"quota_recovered", "manual_resumed"}:
+        # Older versions retained PID records even after declaring recovery.
+        saved.update(active_pids=[], process_identities={})
     write_snapshot(saved)
     try:
         subprocess.run(["systemctl", "--user", "stop", SERVICE_NAME], check=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
-        current = read_snapshot()
-        if current.get("stopped_at") == saved["stopped_at"]:
-            write_snapshot(previous)
+        write_snapshot(previous, expected_snapshot=saved)
         raise
-    # Read again after shutdown so no final monitor write is lost.
-    saved = read_snapshot()
+    # A later pause/stop intent must win over this operation.
+    if read_snapshot() != saved:
+        if not quiet:
+            print("守护已关闭；保留较新的任务状态。")
+        return
     clients = {pid: state for pid, state, _ in ProcessManager.get_codex_client_pids()}
     identities = saved.get("process_identities", {})
     resumed = 0
+    pending = []
     for pid in saved.get("active_pids", []):
         expected = identities.get(str(pid))
         if expected and clients.get(pid) in ("T", "t"):
             if ProcessManager.resume_pid(pid, expected=expected):
                 resumed += 1
+            elif ProcessManager.process_identity(pid) == expected:
+                try:
+                    if ProcessManager.read_stat(pid)[0] in ("T", "t"):
+                        pending.append(pid)
+                except (OSError, IndexError, ValueError):
+                    pass
+    # Retire released/stale ownership so later manual pauses cannot be adopted.
+    released = dict(saved, active_pids=pending,
+                    process_identities={str(pid): identities[str(pid)] for pid in pending})
+    write_snapshot(released, expected_snapshot=saved)
+    if pending:
+        raise RuntimeError("守护已停止，但这些已记录客户端仍处于暂停状态：" +
+                           ", ".join(str(pid) for pid in pending) + "；请重试停止操作。")
     if not quiet:
         print("守护已关闭。" + (f"已解除 {resumed} 个 Codex 客户端的守护暂停。" if resumed else ""))
 
@@ -1560,6 +1579,21 @@ def cmd_fix_mouse(args):
     ProcessManager.reset_all_terminal_mouse_tracking()
     print(f"\033[32m[成功] 已向当前终端及 Codex 终端发送注销转义指令，鼠标追踪已彻底关闭！\033[0m")
     print("终端将不再读取或上报任何鼠标滑动与按键乱码。")
+
+
+def record_manual_resume(previous, clients, resumed, mark_resumed=True):
+    """Keep ownership only for recorded clients whose pause was not released."""
+    stopped = {pid for pid, state, _ in clients if state in ("T", "t")}
+    pending = [pid for pid in previous.get("active_pids", []) if pid in stopped and pid not in resumed]
+    identities = previous.get("process_identities", {})
+    updated = dict(previous, active_pids=pending,
+                   process_identities={str(pid): identities[str(pid)] for pid in pending if str(pid) in identities})
+    if mark_resumed:
+        updated["reason"] = "manual_resumed"
+    elif pending and previous.get("reason") in {"quota_recovered", "manual_resumed"}:
+        updated["reason"] = "manual_pause"
+    if not write_snapshot(updated, expected_snapshot=previous):
+        raise RuntimeError("任务状态已有更新，已保留最新记录；请检查后重试。")
 
 
 def cmd_resume(args):
@@ -1572,21 +1606,25 @@ def cmd_resume(args):
         os.execvp("codex", cmd)
         return
 
+    previous = read_snapshot()
     pids = ProcessManager.get_codex_client_pids()
-    stopped_pids = [p for p, st, _ in pids if st == "T"]
+    stopped_pids = [p for p, st, _ in pids if st in ("T", "t")]
     if not stopped_pids:
+        record_manual_resume(previous, pids, [], mark_resumed=False)
         print("没有处于暂停状态的 Codex 客户端进程需要唤醒。")
         return
+    resumed = []
     for pid in stopped_pids:
         if ProcessManager.resume_pid(pid):
+            resumed.append(pid)
             print(f"已发送 SIGCONT 唤醒 PID: {pid}")
-
-    saved = read_snapshot()
-    saved["reason"] = "manual_resumed"
-    write_snapshot(saved)
+    failed = [pid for pid in stopped_pids if pid not in resumed]
+    record_manual_resume(previous, pids, resumed, mark_resumed=not failed)
+    if failed:
+        raise RuntimeError("部分客户端未能唤醒，未发送继续：" + ", ".join(str(pid) for pid in failed))
     send_cont = not args.no_continue
-    SessionManager.restore_and_verify_sessions(stopped_pids, send_continue=send_cont, continue_prompt=args.continue_prompt)
-    send_notification("Codex 已手动唤醒", f"已唤醒 {len(stopped_pids)} 个 Codex 进程，已恢复原状并继续工作。")
+    SessionManager.restore_and_verify_sessions(resumed, send_continue=send_cont, continue_prompt=args.continue_prompt)
+    send_notification("Codex 已手动唤醒", f"已唤醒 {len(resumed)} 个 Codex 进程，任务恢复请求已处理。")
 
 
 def run_watch_loop(
@@ -1731,10 +1769,10 @@ def run_watch_loop(
                 # A concurrent manual action supersedes this recovery.
                 current = read_snapshot()
                 if not failed and current.get("reason") in auto_reasons:
-                    current["reason"] = "quota_recovered"
-                    current["recovered_at"] = time.time()
-                    write_snapshot(current, automatic=True)
-                    send_notification("Codex 额度已恢复", f"已唤醒 {len(resumed)} 个进程，拉起 {len(launched)} 个会话。")
+                    recovered = dict(current, reason="quota_recovered", recovered_at=time.time(),
+                                     active_pids=[], process_identities={})
+                    if write_snapshot(recovered, automatic=True, expected_snapshot=current):
+                        send_notification("Codex 额度已恢复", f"已唤醒 {len(resumed)} 个进程，拉起 {len(launched)} 个会话。")
 
             if get_auto_continue(auto_continue):
                 clients = ProcessManager.get_codex_client_pids()
@@ -1985,7 +2023,7 @@ class CodexTopDashboard:
             raise RuntimeError("守护正在切换，请稍候。")
         if status["service_active"]:
             cmd_guard_stop(quiet=True)
-            return "守护已关闭，已解除守护记录的客户端暂停。"
+            return "守护已关闭。"
         cmd_guard_start(quiet=True)
         return "守护已开启。"
 
@@ -2010,11 +2048,14 @@ class CodexTopDashboard:
     def resume_clients(self):
         saved = read_snapshot()
         resumed = []
-        for pid, state, _ in ProcessManager.get_codex_client_pids():
+        clients = ProcessManager.get_codex_client_pids()
+        for pid, state, _ in clients:
             if state in ("T", "t") and ProcessManager.resume_pid(pid):
                 resumed.append(pid)
-        saved["reason"] = "manual_resumed"
-        write_snapshot(saved)
+        failed = [pid for pid, state, _ in clients if state in ("T", "t") and pid not in resumed]
+        record_manual_resume(saved, clients, resumed, mark_resumed=not failed)
+        if failed:
+            raise RuntimeError("部分客户端未能唤醒，未发送继续：" + ", ".join(str(pid) for pid in failed))
         status = read_guard_service()
         enabled = get_auto_continue(status["default_auto_continue"])
         SessionManager.restore_and_verify_sessions(resumed, send_continue=enabled,
@@ -2877,7 +2918,7 @@ def main():
                 cmd_guard_start()
             else:
                 cmd_guard_stop()
-        except (OSError, subprocess.SubprocessError) as error:
+        except (OSError, subprocess.SubprocessError, RuntimeError) as error:
             raise SystemExit(f"守护操作失败: {error}")
         return
     parser = argparse.ArgumentParser(
@@ -2995,4 +3036,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError as error:
+        raise SystemExit(f"操作失败: {safe_text(error)}") from None
