@@ -2892,6 +2892,20 @@ class CodexTopDashboard:
 
 
 def cmd_top(args):
+    """Restore terminal state on ordinary stop and terminal hangup signals."""
+    previous = {}
+    def shutdown(signum, frame):
+        raise SystemExit(128 + signum)
+    try:
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            previous[signum] = signal.signal(signum, shutdown)
+        return run_top(args)
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+def run_top(args):
     """启动类似 top/htop 的实时监控控制台"""
     delay = getattr(args, "delay", 1.0)
     batch = getattr(args, "batch", False)

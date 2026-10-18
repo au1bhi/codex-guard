@@ -1,5 +1,5 @@
 """Monitoring regressions with fake RPC data and an isolated PTY reload."""
-import io, os, pty, runpy, select, struct, subprocess, sys, tempfile, termios, fcntl, time, unittest
+import io, os, pty, signal, runpy, select, struct, subprocess, sys, tempfile, termios, fcntl, time, unittest
 from pathlib import Path
 from unittest.mock import patch
 
@@ -168,5 +168,69 @@ class Regression(unittest.TestCase):
             finally:
                 if p.poll() is None:p.kill();p.wait()
                 os.close(master);os.close(slave)
+
+
+    def assert_signal_restores_terminal(self, term, signum):
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / 'codex-top'
+            source = Path(SOURCE).read_text()
+            entrypoint = 'dashboard = CodexTopDashboard(delay=delay, continue_prompt=prompt)'
+            source = source.replace(entrypoint,
+                entrypoint + '\n    dashboard.collect_data = lambda: ' + repr(data()), 1)
+            script.write_text(source)
+            script.chmod(0o700)
+            master, slave = pty.openpty()
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 35, 160, 0, 0))
+            before = termios.tcgetattr(slave)
+            output = bytearray()
+            child = subprocess.Popen([str(script)], stdin=slave, stdout=slave, stderr=slave,
+                env=dict(os.environ, TERM=term, CODEX_HOME=directory), start_new_session=True)
+            try:
+                end = time.monotonic() + 5
+                while time.monotonic() < end:
+                    if select.select([master], [], [], .05)[0]:
+                        output.extend(os.read(master, 65536))
+                    if b'codex-top' in output and b'\x1b[?25l' in output:
+                        break
+                    if child.poll() is not None:
+                        self.fail('Dashboard exited during startup: ' + output.decode(errors='replace'))
+                else:
+                    self.fail('Dashboard startup timed out: ' + output.decode(errors='replace'))
+                child.send_signal(signum)
+                child.wait(timeout=4)
+                while select.select([master], [], [], .05)[0]:
+                    block = os.read(master, 65536)
+                    if not block:
+                        break
+                    output.extend(block)
+                self.assertEqual(termios.tcgetattr(slave), before)
+                self.assertEqual(child.returncode, 128 + signum)
+                self.assertEqual(output.count(b'\x1b[?1049h'), output.count(b'\x1b[?1049l'))
+                self.assertIn(b'\x1b[?25h', output)
+                self.assertNotIn(b'Traceback (most recent call last)', output)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait(timeout=3)
+                termios.tcsetattr(slave, termios.TCSANOW, before)
+                os.close(master)
+                os.close(slave)
+
+    def test_sigterm_restores_curses_and_ansi_terminal(self):
+        for term in ['xterm-256color', 'invalid-audit-term']:
+            with self.subTest(term=term):
+                self.assert_signal_restores_terminal(term, signal.SIGTERM)
+
+    def test_sighup_restores_curses_and_ansi_terminal(self):
+        for term in ['xterm-256color', 'invalid-audit-term']:
+            with self.subTest(term=term):
+                self.assert_signal_restores_terminal(term, signal.SIGHUP)
+
+    def test_top_restores_original_signal_handlers_after_batch(self):
+        from types import SimpleNamespace
+        previous = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGHUP)}
+        with patch.object(D, 'render_batch'):
+            m['cmd_top'](SimpleNamespace(batch=True, delay=1, continue_prompt='continue'))
+        self.assertEqual(previous, {sig: signal.getsignal(sig) for sig in previous})
 
 if __name__=='__main__':unittest.main(verbosity=2)
