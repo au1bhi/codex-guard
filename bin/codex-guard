@@ -1432,10 +1432,14 @@ def cmd_stop(args):
     # 1. 停止后台守护服务
     disable_service = getattr(args, "disable", False) or getattr(args, "subcommand", "") in ("off", "disable")
     keep_service = getattr(args, "keep_service", False)
+    kill_codex = getattr(args, "kill_codex", False)
     if keep_service and (getattr(args, "disable", False) or getattr(args, "subcommand", "") in ("off", "disable")):
         raise SystemExit("--keep-service 与禁用服务选项不能同时使用。")
     if not keep_service:
-        subprocess.run(["systemctl", "--user", "stop", SERVICE_NAME], check=True, timeout=10)
+        if kill_codex:
+            subprocess.run(["systemctl", "--user", "stop", SERVICE_NAME], check=True, timeout=10)
+        else:
+            cmd_guard_stop(quiet=True)
     service_disabled = False
     if disable_service:
         subprocess.run(["systemctl", "--user", "disable", SERVICE_NAME], check=True, timeout=10)
@@ -1471,7 +1475,6 @@ def cmd_stop(args):
     ProcessManager.reset_all_terminal_mouse_tracking()
 
     # 4. 仅在显式传入 --kill-codex 时才终止 Codex 应用自身
-    kill_codex = getattr(args, "kill_codex", False)
     interrupted = []
     target_pids = []
     if kill_codex:
@@ -1875,7 +1878,7 @@ WantedBy=default.target
         print("开机或用户登录时将自动常驻后台监控，额度恢复或回合空闲时将自动发送「继续」，无需手动干预！")
 
     elif action == "uninstall":
-        subprocess.run(["systemctl", "--user", "stop", SERVICE_NAME], check=True, timeout=10)
+        cmd_guard_stop(quiet=True)
         subprocess.run(["systemctl", "--user", "disable", SERVICE_NAME], check=True, timeout=10)
         if os.path.exists(SERVICE_FILE):
             os.remove(SERVICE_FILE)
@@ -1883,11 +1886,11 @@ WantedBy=default.target
         print(f"\033[32m[成功] 已卸载后台服务: {SERVICE_NAME}\033[0m")
 
     elif action == "stop":
-        subprocess.run(["systemctl", "--user", "stop", SERVICE_NAME], check=True, timeout=10)
+        cmd_guard_stop(quiet=True)
         print(f"\033[32m[成功] 已停止后台守护服务: {SERVICE_NAME}\033[0m")
 
     elif action == "disable":
-        subprocess.run(["systemctl", "--user", "stop", SERVICE_NAME], check=True, timeout=10)
+        cmd_guard_stop(quiet=True)
         subprocess.run(["systemctl", "--user", "disable", SERVICE_NAME], check=True, timeout=10)
         print(f"\033[32m[成功] 已停止并禁用后台守护服务: {SERVICE_NAME}\033[0m")
 

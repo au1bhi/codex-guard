@@ -350,6 +350,119 @@ class GuardStartTests(IsolatedTest):
                 self.assertEqual(cg.read_snapshot(), previous)
 
 
+class StopCleanupTests(IsolatedTest):
+    def saved_clients(self):
+        identity = {"start_time": "100", "boot_id": "boot"}
+        cg.write_snapshot({"reason": "quota_exceeded", "active_pids": [55555, 55556],
+                           "process_identities": {"55555": identity}})
+        return identity
+
+    def test_service_stop_modes_release_only_recorded_verified_clients(self):
+        for action in ["stop", "disable", "uninstall"]:
+            with self.subTest(action=action):
+                identity = self.saved_clients()
+                unit = Path(self.tmp.name) / "guard.service"
+                unit.write_text("test")
+                with patch("subprocess.run"), patch.object(cg, "SERVICE_FILE", str(unit)), \
+                     patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[
+                         (55555, "T", "codex"), (55556, "T", "codex"), (55557, "T", "codex")]), \
+                     patch.object(cg.ProcessManager, "resume_pid", return_value=True) as resume, \
+                     patch.object(cg.ProcessManager, "terminate_pid") as terminate, \
+                     patch.object(cg.SessionManager, "send_continue_prompt") as queue:
+                    cg.cmd_service(MagicMock(action=action))
+                resume.assert_called_once_with(55555, expected=identity)
+                terminate.assert_not_called(); queue.assert_not_called()
+                self.assertEqual(cg.read_snapshot()["reason"], "manual_stopped")
+
+    def test_failed_service_stop_preserves_files_and_pause_record(self):
+        for action in ["stop", "disable", "uninstall"]:
+            with self.subTest(action=action):
+                self.saved_clients(); previous = cg.read_snapshot()
+                unit = Path(self.tmp.name) / "guard.service"; unit.write_text("test")
+                with patch("subprocess.run", side_effect=subprocess.CalledProcessError(1, "systemctl")), \
+                     patch.object(cg, "SERVICE_FILE", str(unit)), \
+                     patch.object(cg.ProcessManager, "resume_pid") as resume:
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        cg.cmd_service(MagicMock(action=action))
+                resume.assert_not_called(); self.assertTrue(unit.exists())
+                self.assertEqual(cg.read_snapshot(), previous)
+
+    def test_stop_command_releases_guard_pauses(self):
+        identity = self.saved_clients()
+        args = MagicMock(keep_service=False, disable=False, subcommand="stop", kill_codex=False)
+        with patch("subprocess.run"), patch("os.listdir", return_value=[]), \
+             patch.object(cg, "send_notification"), \
+             patch.object(cg.ProcessManager, "reset_all_terminal_mouse_tracking"), \
+             patch.object(cg.ProcessManager, "get_codex_client_pids", return_value=[(55555, "T", "codex")]), \
+             patch.object(cg.ProcessManager, "resume_pid", return_value=True) as resume:
+            cg.cmd_stop(args)
+        resume.assert_called_once_with(55555, expected=identity)
+
+    def test_keep_service_does_not_release_guard_pauses(self):
+        self.saved_clients(); previous = cg.read_snapshot()
+        args = MagicMock(keep_service=True, disable=False, subcommand="stop", kill_codex=False)
+        with patch("subprocess.run") as run, patch("os.listdir", return_value=[]), \
+             patch.object(cg, "send_notification"), \
+             patch.object(cg.ProcessManager, "reset_all_terminal_mouse_tracking"), \
+             patch.object(cg.ProcessManager, "resume_pid") as resume:
+            cg.cmd_stop(args)
+        run.assert_not_called(); resume.assert_not_called()
+        self.assertEqual(cg.read_snapshot(), previous)
+
+    def install_fixture(self, fail_stop=False):
+        home = Path(self.tmp.name) / "home with spaces"; home.mkdir()
+        tools = Path(self.tmp.name) / "tools"; tools.mkdir()
+        fake = tools / "systemctl"
+        fake.write_text("#!/bin/sh\n" + ("for arg do\n[ \"$arg\" != stop ] || exit 1\ndone\n" if fail_stop else "") + "exit 0\n")
+        fake.chmod(0o755)
+        env = dict(os.environ, HOME=str(home), CODEX_HOME=str(home / ".codex"),
+                   PATH=str(tools) + os.pathsep + os.environ["PATH"])
+        subprocess.run(["bash", str(ROOT / "scripts/install.sh")], env=env, capture_output=True, check=True)
+        (home / ".codex").mkdir()
+        return home, env
+
+    def test_uninstall_script_resumes_real_recorded_child_only(self):
+        home, env = self.install_fixture()
+        def cleanup(proc):
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGCONT); proc.terminate()
+            proc.wait(timeout=3)
+        children = []
+        for _ in range(2):
+            proc = subprocess.Popen(["bash", "-c", "exec -a codex sleep 30"])
+            self.addCleanup(cleanup, proc); children.append(proc)
+            deadline = time.monotonic() + 3
+            while Path(f"/proc/{proc.pid}/cmdline").read_bytes().split(b"\0")[0] != b"codex":
+                self.assertLess(time.monotonic(), deadline); time.sleep(.01)
+            proc.send_signal(signal.SIGSTOP)
+            while cg.ProcessManager.read_stat(proc.pid)[0] != "T":
+                self.assertLess(time.monotonic(), deadline); time.sleep(.01)
+        recorded, unrelated = children
+        identity = cg.ProcessManager.process_identity(recorded.pid)
+        snapshot = home / ".codex/quota_guard_snapshot.json"
+        snapshot.write_text(json.dumps({"reason": "quota_exceeded", "active_pids": [recorded.pid],
+            "process_identities": {str(recorded.pid): identity}, "sessions": [{"id": "saved"}]}))
+        subprocess.run(["bash", str(ROOT / "scripts/uninstall.sh")], env=env, capture_output=True, check=True)
+        self.assertNotEqual(cg.ProcessManager.read_stat(recorded.pid)[0], "T")
+        self.assertEqual(cg.ProcessManager.read_stat(unrelated.pid)[0], "T")
+        self.assertIsNone(recorded.poll()); self.assertIsNone(unrelated.poll())
+        saved = json.loads(snapshot.read_text())
+        self.assertEqual(saved["sessions"], [{"id": "saved"}]); self.assertEqual(saved["reason"], "manual_stopped")
+        self.assertFalse((home / ".local/lib/codex-guard/codex-guard").exists())
+
+    def test_uninstall_script_preserves_program_when_stop_fails(self):
+        home, env = self.install_fixture(fail_stop=True)
+        snapshot = home / ".codex/quota_guard_snapshot.json"
+        previous = {"reason": "quota_exceeded", "sessions": [{"id": "saved"}]}
+        snapshot.write_text(json.dumps(previous))
+        result = subprocess.run(["bash", str(ROOT / "scripts/uninstall.sh")], env=env, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((home / ".local/bin/codexguard-stop").exists())
+        self.assertTrue((home / ".local/lib/codex-guard/codex-guard").exists())
+        self.assertTrue((home / ".config/systemd/user/codex-quota-guard.service").exists())
+        self.assertEqual(json.loads(snapshot.read_text()), previous)
+
+
 class WebSocketTests(IsolatedTest):
     @staticmethod
     def frame(data, opcode=1, final=True):
@@ -629,7 +742,8 @@ class CliAndServiceTests(IsolatedTest):
         fake = tools_dir / "systemctl"
         fake.write_text("#!/bin/sh\nexit 0\n")
         fake.chmod(0o755)
-        env = dict(os.environ, HOME=str(home), PATH=str(tools_dir) + os.pathsep + os.environ["PATH"])
+        env = dict(os.environ, HOME=str(home), CODEX_HOME=str(home / ".codex"),
+                   PATH=str(tools_dir) + os.pathsep + os.environ["PATH"])
         old_bin = home / ".local/bin"
         old_bin.mkdir(parents=True)
         for alias in ["codex-guard", "codex-quota", "codex-stop", "codex-kill", "codex-fix-mouse"]:

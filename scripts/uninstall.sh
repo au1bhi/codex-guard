@@ -8,7 +8,10 @@ LIB_DIR="${HOME}/.local/lib/codex-guard"
 echo "=== Uninstalling Codex Guard ==="
 
 # Stop and disable systemd service
-if systemctl --user is-active --quiet codex-quota-guard 2>/dev/null; then
+if [ -x "${BIN_DIR}/codexguard-stop" ] && [ -f "${SERVICE_FILE}" ]; then
+    # Release verified clients before removing the command needed to resume them.
+    "${BIN_DIR}/codexguard-stop"
+elif systemctl --user is-active --quiet codex-quota-guard 2>/dev/null; then
     systemctl --user stop codex-quota-guard
 fi
 if systemctl --user is-enabled --quiet codex-quota-guard 2>/dev/null; then

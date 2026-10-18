@@ -59,6 +59,8 @@ bash scripts/install.sh
 
 ## 卸载
 
+停用或卸载会先唤醒快照中记录且身份匹配的暂停客户端，不发送「继续」，也不唤醒其他被暂停的进程。停止服务失败时中止卸载，保留程序与服务文件。
+
 ```bash
 bash scripts/uninstall.sh
 ```
